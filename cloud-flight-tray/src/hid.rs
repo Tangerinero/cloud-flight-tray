@@ -68,33 +68,27 @@ pub fn query_battery(device: &mut HidDevice) -> RawStatus {
     }
 
     let mut buf = [0u8; 64];
-    if let Ok(n) = device.get_feature_report(&mut buf) {
-        if let Some(parsed) = parse_report(&buf[..n.max(5)]) {
+    if let Ok(n) = device.read_timeout(&mut buf, POLL_READ_TIMEOUT) {
+        if n > 0 {
+            if let Some(parsed) = parse_report(&buf[..n]) {
+                return parsed;
+            }
+        }
+    }
+
+    let mut feature = [0u8; 64];
+    feature[0] = 0x21;
+    if let Ok(n) = device.get_feature_report(&mut feature) {
+        if let Some(parsed) = parse_report(&feature[..n.max(5)]) {
             return parsed;
         }
     }
 
-    let mut buf = [0u8; 64];
-    buf[0] = 0x21;
-    if let Ok(n) = device.get_feature_report(&mut buf) {
-        if let Some(parsed) = parse_report(&buf[..n.max(5)]) {
-            return parsed;
-        }
-    }
-
-    match device.read_timeout(&mut buf, POLL_READ_TIMEOUT) {
-        Ok(n) if n > 0 => parse_report(&buf[..n]).unwrap_or(RawStatus {
-            connection: Connection::HeadsetOff,
-            charging: false,
-            percent: None,
-            raw: None,
-        }),
-        _ => RawStatus {
-            connection: Connection::HeadsetOff,
-            charging: false,
-            percent: None,
-            raw: None,
-        },
+    RawStatus {
+        connection: Connection::HeadsetOff,
+        charging: false,
+        percent: None,
+        raw: None,
     }
 }
 
@@ -149,15 +143,11 @@ pub fn parse_report(data: &[u8]) -> Option<RawStatus> {
         });
     }
 
-    if data.len() < 5 {
+    if data.len() < 5 || data[0] != 0x21 || data[1] != 0xFF || data[2] != 0x05 {
         return None;
     }
 
-    let (upper, lower) = if data[0] == 0x21 && data[1] == 0xFF && data[2] == 0x05 {
-        (data[3], data[4])
-    } else {
-        (data[3], data[4])
-    };
+    let (upper, lower) = (data[3], data[4]);
 
     match parse_battery_bytes(upper, lower) {
         BatteryReading::Charging => Some(RawStatus {
@@ -191,6 +181,11 @@ mod tests {
     fn parse_power_off() {
         let s = parse_report(&[0x64, 0x03]).unwrap();
         assert_eq!(s.connection, Connection::HeadsetOff);
+    }
+
+    #[test]
+    fn unknown_header_is_ignored() {
+        assert!(parse_report(&[0x01, 0x02, 0x03, 0x0E, 0xC8]).is_none());
     }
 
     #[test]

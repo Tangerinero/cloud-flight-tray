@@ -5,6 +5,9 @@ const THRESHOLDS: [u16; 20] = [
     3910, 3940, 3960, 3970,
 ];
 
+/// Headset hardware cuts off near 3.20 V, not at a raw value of 0.
+const CUTOFF_RAW: u16 = 3200;
+
 const PERCENTAGES: [f32; 20] = [
     5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0,
     85.0, 90.0, 95.0, 100.0,
@@ -35,8 +38,12 @@ pub fn interpolate_percent(raw: u16) -> f32 {
     if raw >= *THRESHOLDS.last().unwrap() {
         return 100.0;
     }
+    if raw <= CUTOFF_RAW {
+        return 0.0;
+    }
     if raw <= THRESHOLDS[0] {
-        let t = raw as f32 / THRESHOLDS[0] as f32;
+        let span = (THRESHOLDS[0] - CUTOFF_RAW) as f32;
+        let t = (raw - CUTOFF_RAW) as f32 / span;
         return (PERCENTAGES[0] * t).clamp(0.0, PERCENTAGES[0]);
     }
 
@@ -56,6 +63,15 @@ pub fn interpolate_percent(raw: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cutoff_floor() {
+        assert_eq!(interpolate_percent(3200), 0.0);
+        assert_eq!(interpolate_percent(3000), 0.0);
+        let mid = interpolate_percent(3264);
+        assert!((mid - 2.5).abs() < 0.01, "got {mid}");
+        assert_eq!(interpolate_percent(3328), 5.0);
+    }
 
     #[test]
     fn exact_thresholds() {

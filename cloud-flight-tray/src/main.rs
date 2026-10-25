@@ -180,6 +180,8 @@ impl App {
                 && prev.drain.percent_per_hour.map(|r| (r * 10.0) as i32)
                     == update.drain.percent_per_hour.map(|r| (r * 10.0) as i32)
                 && prev.drain.remaining_secs == update.drain.remaining_secs
+                && prev.drain.estimated_health_pct.map(|h| h.round() as i32)
+                    == update.drain.estimated_health_pct.map(|h| h.round() as i32)
         }) {
             self.last = Some(update);
             return;
@@ -422,9 +424,10 @@ fn battery_line(update: &HeadsetUpdate) -> String {
 }
 
 fn drain_line(drain: &DrainStats) -> String {
-    match drain.percent_per_hour {
-        Some(r) => format!("Drain: {r:.2}%/h"),
-        None => "Drain: need ~10 min of use".into(),
+    match (drain.percent_per_hour, drain.estimated_health_pct) {
+        (Some(r), Some(health)) => format!("Drain: {r:.2}%/h (~{health:.0}% health)"),
+        (Some(r), None) => format!("Drain: {r:.2}%/h"),
+        _ => "Drain: need ~10 min of use".into(),
     }
 }
 

@@ -26,30 +26,34 @@ pub struct DrainStats {
     pub remaining_secs: Option<u64>,
     pub session_drop: Option<f32>,
     pub session_secs: Option<u64>,
+    pub estimated_health_pct: Option<f32>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct HistoryFile {
     samples: Vec<Sample>,
+    #[serde(default)]
+    learned_nominal_rate: Option<f32>,
 }
 
 pub struct DrainTracker {
     samples: Vec<Sample>,
     session_start: Option<Sample>,
+    learned_nominal_rate: Option<f32>,
     path: PathBuf,
 }
 
 impl DrainTracker {
     pub fn load() -> Self {
         let path = history_path();
-        let samples = fs::read_to_string(&path)
+        let loaded = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<HistoryFile>(&raw).ok())
-            .map(|h| h.samples)
             .unwrap_or_default();
         let mut tracker = Self {
-            samples,
+            samples: loaded.samples,
             session_start: None,
+            learned_nominal_rate: loaded.learned_nominal_rate,
             path,
         };
         tracker.prune(now_secs());
@@ -59,6 +63,9 @@ impl DrainTracker {
     pub fn record(&mut self, percent: f32, charging: bool, connected: bool) -> DrainStats {
         let t = now_secs();
         if !connected || charging {
+            if charging {
+                self.session_start = None;
+            }
             self.prune(t);
             let current = self.samples.last().map(|s| s.p);
             return self.stats(current, t);
@@ -75,6 +82,7 @@ impl DrainTracker {
             self.samples.push(sample);
         }
         self.prune(t);
+        self.maybe_learn(t);
         self.persist();
         self.stats(Some(percent), t)
     }
@@ -100,6 +108,7 @@ impl DrainTracker {
         }
         let payload = HistoryFile {
             samples: self.samples.clone(),
+            learned_nominal_rate: self.learned_nominal_rate,
         };
         if let Ok(json) = serde_json::to_string(&payload) {
             let _ = fs::write(&self.path, json);
@@ -125,7 +134,10 @@ impl DrainTracker {
         let segment = discharge_segment(&window);
         let measured = net_rate(segment);
         let drop = net_drop(segment);
-        let rate = blend_rate(measured, drop);
+        let nominal = self
+            .learned_nominal_rate
+            .unwrap_or(NOMINAL_PERCENT_PER_HOUR);
+        let rate = blend_rate(measured, drop, nominal);
         if let Some(pct) = current {
             if rate > 0.05 {
                 stats.percent_per_hour = Some(rate);
@@ -133,7 +145,27 @@ impl DrainTracker {
                 stats.remaining_secs = Some((hours * 3600.0).max(0.0) as u64);
             }
         }
+        stats.estimated_health_pct = health_rate(measured, drop, self.learned_nominal_rate)
+            .map(health_pct);
         stats
+    }
+
+    fn maybe_learn(&mut self, now: i64) {
+        let window_start = now - FIT_WINDOW_SECS;
+        let window: Vec<_> = self
+            .samples
+            .iter()
+            .copied()
+            .filter(|s| s.t >= window_start)
+            .collect();
+        let segment = discharge_segment(&window);
+        let Some(measured) = net_rate(segment) else {
+            return;
+        };
+        if net_drop(segment) < FULL_TRUST_DROP || measured <= 0.5 {
+            return;
+        }
+        self.learned_nominal_rate = Some(learn_rate(self.learned_nominal_rate, measured));
     }
 }
 
@@ -191,15 +223,34 @@ fn median_percent(samples: &[Sample]) -> f32 {
 
 /// Trust the measured session rate once the level has fallen enough to beat sensor noise.
 /// Until then, lean on the 30 h / 1500 mAh rating (3.33%/h).
-fn blend_rate(measured: Option<f32>, drop: f32) -> f32 {
+fn blend_rate(measured: Option<f32>, drop: f32, nominal: f32) -> f32 {
     match measured {
         Some(measured) if measured > 0.05 && drop >= FULL_TRUST_DROP => measured,
         Some(measured) if measured > 0.05 => {
             let weight = (drop / FULL_TRUST_DROP).clamp(0.0, 1.0);
-            weight * measured + (1.0 - weight) * NOMINAL_PERCENT_PER_HOUR
+            weight * measured + (1.0 - weight) * nominal
         }
-        _ => NOMINAL_PERCENT_PER_HOUR,
+        _ => nominal,
     }
+}
+
+fn learn_rate(old: Option<f32>, measured: f32) -> f32 {
+    let next = match old {
+        Some(old) => 0.7 * old + 0.3 * measured,
+        None => measured,
+    };
+    next.clamp(2.5, 40.0)
+}
+
+fn health_rate(measured: Option<f32>, drop: f32, learned: Option<f32>) -> Option<f32> {
+    if drop >= FULL_TRUST_DROP && measured.is_some_and(|rate| rate > 0.5) {
+        return measured;
+    }
+    learned
+}
+
+fn health_pct(active_rate: f32) -> f32 {
+    (NOMINAL_PERCENT_PER_HOUR / active_rate * 100.0).clamp(5.0, 100.0)
 }
 
 #[cfg(test)]
@@ -262,7 +313,11 @@ mod tests {
             })
             .collect();
         assert!(net_rate(&samples).is_none() || net_rate(&samples) == Some(0.0));
-        let rate = blend_rate(net_rate(&samples), net_drop(&samples));
+        let rate = blend_rate(
+            net_rate(&samples),
+            net_drop(&samples),
+            NOMINAL_PERCENT_PER_HOUR,
+        );
         assert!((rate - NOMINAL_PERCENT_PER_HOUR).abs() < 0.01, "got {rate}");
         let hours = 97.0 / rate;
         assert!((hours - 29.1).abs() < 0.2, "got {hours}");
@@ -289,7 +344,7 @@ mod tests {
         }
         let measured = net_rate(&samples).unwrap();
         let drop = net_drop(&samples);
-        let rate = blend_rate(Some(measured), drop);
+        let rate = blend_rate(Some(measured), drop, NOMINAL_PERCENT_PER_HOUR);
         assert!(drop > 10.0, "drop {drop}");
         assert!(
             (rate - measured).abs() < 0.01,
@@ -304,5 +359,18 @@ mod tests {
             remaining_h < 30.0 && remaining_h > 10.0,
             "remaining {remaining_h}"
         );
+    }
+
+    #[test]
+    fn learned_rate_and_health() {
+        assert!((learn_rate(None, 8.5) - 8.5).abs() < 0.01);
+        let blended = learn_rate(Some(NOMINAL_PERCENT_PER_HOUR), 8.5);
+        let expected = 0.7 * NOMINAL_PERCENT_PER_HOUR + 0.3 * 8.5;
+        assert!((blended - expected).abs() < 0.01, "got {blended}");
+        assert_eq!(learn_rate(None, 80.0), 40.0);
+        let health = health_pct(8.5);
+        assert!((health - 39.2).abs() < 0.2, "got {health}");
+        assert!(health_rate(Some(8.5), 3.0, None).is_some());
+        assert!(health_rate(Some(8.5), 1.0, None).is_none());
     }
 }
