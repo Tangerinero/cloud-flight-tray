@@ -4,10 +4,15 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_AGE_SECS: i64 = 24 * 60 * 60;
+const FIT_WINDOW_SECS: i64 = 8 * 60 * 60;
 const MIN_WINDOW_SECS: i64 = 10 * 60;
-const TARGET_WINDOW_SECS: i64 = 90 * 60;
-const MAX_SAMPLES: usize = 500;
-const RATE_EPSILON: f32 = 0.05;
+/// Cloud Flight pack: 1500 mAh, rated about 30 h, so 3.33%/h until real drain shows.
+const NOMINAL_PERCENT_PER_HOUR: f32 = 100.0 / 30.0;
+/// Net drop required before the measured rate fully replaces the 30 h rating.
+const FULL_TRUST_DROP: f32 = 2.0;
+/// A jump larger than sensor noise starts a new discharge segment.
+const RECHARGE_JUMP: f32 = 4.0;
+const MAX_SAMPLES: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Sample {
@@ -110,25 +115,20 @@ impl DrainTracker {
             }
         }
 
-        let window_start = now - TARGET_WINDOW_SECS;
+        let window_start = now - FIT_WINDOW_SECS;
         let window: Vec<_> = self
             .samples
             .iter()
             .copied()
             .filter(|s| s.t >= window_start)
             .collect();
-        if window.len() < 2 {
-            return stats;
-        }
-        let span = window.last().unwrap().t - window.first().unwrap().t;
-        if span < MIN_WINDOW_SECS {
-            return stats;
-        }
-
-        let rate = slope_percent_per_hour(&window);
-        if rate > RATE_EPSILON {
-            stats.percent_per_hour = Some(rate);
-            if let Some(pct) = current {
+        let segment = discharge_segment(&window);
+        let measured = net_rate(segment);
+        let drop = net_drop(segment);
+        let rate = blend_rate(measured, drop);
+        if let Some(pct) = current {
+            if rate > 0.05 {
+                stats.percent_per_hour = Some(rate);
                 let hours = pct / rate;
                 stats.remaining_secs = Some((hours * 3600.0).max(0.0) as u64);
             }
@@ -137,6 +137,72 @@ impl DrainTracker {
     }
 }
 
+fn discharge_segment(samples: &[Sample]) -> &[Sample] {
+    let mut start = 0;
+    for i in 1..samples.len() {
+        if samples[i].p - samples[i - 1].p > RECHARGE_JUMP {
+            start = i;
+        }
+    }
+    &samples[start..]
+}
+
+fn net_drop(samples: &[Sample]) -> f32 {
+    let Some((start, end)) = end_medians(samples) else {
+        return 0.0;
+    };
+    (start - end).max(0.0)
+}
+
+fn net_rate(samples: &[Sample]) -> Option<f32> {
+    let (start, end) = end_medians(samples)?;
+    let span = samples.last()?.t - samples.first()?.t;
+    if span < MIN_WINDOW_SECS {
+        return None;
+    }
+    let hours = span as f32 / 3600.0;
+    Some(((start - end) / hours).max(0.0))
+}
+
+fn end_medians(samples: &[Sample]) -> Option<(f32, f32)> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let k = 5.min(samples.len() / 2).max(1);
+    if k * 2 > samples.len() {
+        return None;
+    }
+    Some((
+        median_percent(&samples[..k]),
+        median_percent(&samples[samples.len() - k..]),
+    ))
+}
+
+fn median_percent(samples: &[Sample]) -> f32 {
+    let mut vals: Vec<f32> = samples.iter().map(|s| s.p).collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = vals.len() / 2;
+    if vals.len() % 2 == 0 {
+        (vals[mid - 1] + vals[mid]) / 2.0
+    } else {
+        vals[mid]
+    }
+}
+
+/// Trust the measured session rate once the level has fallen enough to beat sensor noise.
+/// Until then, lean on the 30 h / 1500 mAh rating (3.33%/h).
+fn blend_rate(measured: Option<f32>, drop: f32) -> f32 {
+    match measured {
+        Some(measured) if measured > 0.05 && drop >= FULL_TRUST_DROP => measured,
+        Some(measured) if measured > 0.05 => {
+            let weight = (drop / FULL_TRUST_DROP).clamp(0.0, 1.0);
+            weight * measured + (1.0 - weight) * NOMINAL_PERCENT_PER_HOUR
+        }
+        _ => NOMINAL_PERCENT_PER_HOUR,
+    }
+}
+
+#[cfg(test)]
 fn slope_percent_per_hour(samples: &[Sample]) -> f32 {
     let n = samples.len() as f32;
     let mut sum_t = 0.0;
@@ -181,12 +247,62 @@ mod tests {
     fn slope_detects_drain() {
         let samples = [
             Sample { t: 0, p: 80.0 },
-            Sample {
-                t: 3600,
-                p: 76.0,
-            },
+            Sample { t: 3600, p: 76.0 },
         ];
         let rate = slope_percent_per_hour(&samples);
         assert!((rate - 4.0).abs() < 0.01, "got {rate}");
+    }
+
+    #[test]
+    fn flat_full_charge_uses_thirty_hour_rating() {
+        let samples: Vec<_> = (0..12)
+            .map(|i| Sample {
+                t: i * 60,
+                p: 100.0,
+            })
+            .collect();
+        assert!(net_rate(&samples).is_none() || net_rate(&samples) == Some(0.0));
+        let rate = blend_rate(net_rate(&samples), net_drop(&samples));
+        assert!((rate - NOMINAL_PERCENT_PER_HOUR).abs() < 0.01, "got {rate}");
+        let hours = 97.0 / rate;
+        assert!((hours - 29.1).abs() < 0.2, "got {hours}");
+    }
+
+    #[test]
+    fn noisy_session_matches_net_drop_not_shallow_fit() {
+        let mut samples = Vec::new();
+        for i in 0..20 {
+            samples.push(Sample {
+                t: i * 60,
+                p: 100.0,
+            });
+        }
+        let noisy = [
+            97.5, 100.0, 97.5, 97.0, 99.0, 94.75, 97.5, 95.0, 94.25, 93.5, 92.0, 90.5, 89.5,
+            88.5, 87.5, 86.5, 85.7,
+        ];
+        for (i, p) in noisy.iter().enumerate() {
+            samples.push(Sample {
+                t: 20 * 60 + i as i64 * 600,
+                p: *p,
+            });
+        }
+        let measured = net_rate(&samples).unwrap();
+        let drop = net_drop(&samples);
+        let rate = blend_rate(Some(measured), drop);
+        assert!(drop > 10.0, "drop {drop}");
+        assert!(
+            (rate - measured).abs() < 0.01,
+            "expected full trust, rate {rate} measured {measured}"
+        );
+        assert!(
+            measured > 3.0 && measured < 8.0,
+            "net rate {measured} should track the real drop, not ~2%/h"
+        );
+        let remaining_h = 85.7 / rate;
+        assert!(
+            remaining_h < 30.0 && remaining_h > 10.0,
+            "remaining {remaining_h}"
+        );
     }
 }

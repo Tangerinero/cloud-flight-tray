@@ -20,8 +20,8 @@ The dongle does not report milliamp-hours or a fuel-gauge percentage. It returns
 
 Drain and time remaining come from how that percent changes while the headset is on and not charging:
 
-- **Drain** is the fitted drop over roughly the last 90 minutes, in percent per hour. It stays blank until there are at least 10 minutes of discharging samples, so a short noisy stretch does not invent a huge rate.
-- **Remaining** is `current percent / drain rate`. It assumes that recent rate continues. It does not use the 1500 mAh pack size or HyperX’s “up to 30 hours” rating. Near a full charge the status value moves slowly, so the estimate can read longer than 30 hours. It gets more meaningful after a longer stretch of real use.
+- **Drain** is the net drop from the median of the oldest samples to the median of the newest ones, over up to 8 hours. Medians ignore the 1–2% jumps the dongle reports between polls. Until the level has fallen by about 2%, the rate stays near the pack rating of 3.33%/h (1500 mAh, about 30 hours).
+- **Remaining** is `current percent / drain rate`. After a real drop it follows this session’s pace, which can be shorter or longer than 30 hours depending on volume. A fresh full charge starts near 30 hours instead of a huge number from a flat reading.
 - **Session** is how much the percent fell since this run started.
 
 Samples are stored in `%LOCALAPPDATA%\cloud-flight-tray\history.json` and kept for about 24 hours. Charging and disconnect gaps are left out of the slope.
