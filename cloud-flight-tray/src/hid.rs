@@ -5,6 +5,7 @@ use std::time::Duration;
 pub const KINGSTON_VID: u16 = 0x0951;
 pub const HP_VID: u16 = 0x03F0;
 pub const STATUS_USAGE: u16 = 771;
+pub const POWER_USAGE_PAGE: u16 = 65472;
 
 const KNOWN_PIDS: &[(u16, u16)] = &[
     (KINGSTON_VID, 0x16C4),
@@ -53,12 +54,16 @@ pub fn is_supported(vid: u16, pid: u16) -> bool {
     KNOWN_PIDS.contains(&(vid, pid))
 }
 
-pub fn poll_once(api: &HidApi) -> RawStatus {
-    let Some(mut device) = open_status_device(api) else {
-        return RawStatus::disconnected();
-    };
+pub fn open_status_device(api: &HidApi) -> Option<HidDevice> {
+    open_matching(api, |info| info.usage() == STATUS_USAGE)
+}
 
-    if send_status_request(&mut device).is_err() {
+pub fn open_power_device(api: &HidApi) -> Option<HidDevice> {
+    open_matching(api, |info| info.usage_page() == POWER_USAGE_PAGE)
+}
+
+pub fn query_battery(device: &mut HidDevice) -> RawStatus {
+    if send_status_request(device).is_err() {
         return RawStatus::disconnected();
     }
 
@@ -79,13 +84,13 @@ pub fn poll_once(api: &HidApi) -> RawStatus {
 
     match device.read_timeout(&mut buf, POLL_READ_TIMEOUT) {
         Ok(n) if n > 0 => parse_report(&buf[..n]).unwrap_or(RawStatus {
-            connection: Connection::Connected,
+            connection: Connection::HeadsetOff,
             charging: false,
             percent: None,
             raw: None,
         }),
         _ => RawStatus {
-            connection: Connection::Connected,
+            connection: Connection::HeadsetOff,
             charging: false,
             percent: None,
             raw: None,
@@ -93,24 +98,22 @@ pub fn poll_once(api: &HidApi) -> RawStatus {
     }
 }
 
-fn open_status_device(api: &HidApi) -> Option<HidDevice> {
-    let mut candidates: Vec<_> = api
-        .device_list()
-        .filter(|info| is_supported(info.vendor_id(), info.product_id()))
-        .collect();
-    candidates.sort_by_key(|info| {
-        if info.usage() == STATUS_USAGE {
-            0
-        } else {
-            1
-        }
-    });
+/// Power on/off arrives as a 2-byte input report on the power interface.
+pub fn read_power(device: &mut HidDevice, timeout_ms: i32) -> hidapi::HidResult<Option<Connection>> {
+    let mut buf = [0u8; 8];
+    let n = device.read_timeout(&mut buf, timeout_ms)?;
+    if n < 2 {
+        return Ok(None);
+    }
+    Ok(parse_report(&buf[..n]).map(|status| status.connection))
+}
 
-    for info in candidates {
-        if let Ok(dev) = api.open_path(info.path()) {
-            return Some(dev);
+fn open_matching(api: &HidApi, pred: impl Fn(&hidapi::DeviceInfo) -> bool) -> Option<HidDevice> {
+    for info in api.device_list() {
+        if !is_supported(info.vendor_id(), info.product_id()) || !pred(info) {
+            continue;
         }
-        if let Ok(dev) = api.open(info.vendor_id(), info.product_id()) {
+        if let Ok(dev) = api.open_path(info.path()) {
             return Some(dev);
         }
     }
@@ -188,6 +191,13 @@ mod tests {
     fn parse_power_off() {
         let s = parse_report(&[0x64, 0x03]).unwrap();
         assert_eq!(s.connection, Connection::HeadsetOff);
+    }
+
+    #[test]
+    fn parse_power_on() {
+        let s = parse_report(&[0x64, 0x01]).unwrap();
+        assert_eq!(s.connection, Connection::Connected);
+        assert!(s.percent.is_none());
     }
 
     #[test]
