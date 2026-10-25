@@ -12,6 +12,8 @@ const NOMINAL_PERCENT_PER_HOUR: f32 = 100.0 / 30.0;
 const FULL_TRUST_DROP: f32 = 2.0;
 /// A jump larger than sensor noise starts a new discharge segment.
 const RECHARGE_JUMP: f32 = 4.0;
+/// Per new sample. 0.02 keeps prior sessions for hours instead of washing them out in minutes.
+const LEARN_ALPHA: f32 = 0.02;
 const MAX_SAMPLES: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -34,12 +36,15 @@ struct HistoryFile {
     samples: Vec<Sample>,
     #[serde(default)]
     learned_nominal_rate: Option<f32>,
+    #[serde(default)]
+    was_charging: bool,
 }
 
 pub struct DrainTracker {
     samples: Vec<Sample>,
     session_start: Option<Sample>,
     learned_nominal_rate: Option<f32>,
+    was_charging: bool,
     path: PathBuf,
 }
 
@@ -54,6 +59,7 @@ impl DrainTracker {
             samples: loaded.samples,
             session_start: None,
             learned_nominal_rate: loaded.learned_nominal_rate,
+            was_charging: loaded.was_charging,
             path,
         };
         tracker.prune(now_secs());
@@ -64,11 +70,19 @@ impl DrainTracker {
         let t = now_secs();
         if !connected || charging {
             if charging {
+                self.was_charging = true;
                 self.session_start = None;
             }
             self.prune(t);
+            self.persist();
             let current = self.samples.last().map(|s| s.p);
             return self.stats(current, t);
+        }
+
+        if self.was_charging {
+            self.samples.clear();
+            self.was_charging = false;
+            self.session_start = None;
         }
 
         let sample = Sample { t, p: percent };
@@ -80,9 +94,9 @@ impl DrainTracker {
         });
         if should_push {
             self.samples.push(sample);
+            self.maybe_learn(t);
         }
         self.prune(t);
-        self.maybe_learn(t);
         self.persist();
         self.stats(Some(percent), t)
     }
@@ -109,6 +123,7 @@ impl DrainTracker {
         let payload = HistoryFile {
             samples: self.samples.clone(),
             learned_nominal_rate: self.learned_nominal_rate,
+            was_charging: self.was_charging,
         };
         if let Ok(json) = serde_json::to_string(&payload) {
             let _ = fs::write(&self.path, json);
@@ -236,7 +251,7 @@ fn blend_rate(measured: Option<f32>, drop: f32, nominal: f32) -> f32 {
 
 fn learn_rate(old: Option<f32>, measured: f32) -> f32 {
     let next = match old {
-        Some(old) => 0.7 * old + 0.3 * measured,
+        Some(old) => (1.0 - LEARN_ALPHA) * old + LEARN_ALPHA * measured,
         None => measured,
     };
     next.clamp(2.5, 40.0)
@@ -365,12 +380,82 @@ mod tests {
     fn learned_rate_and_health() {
         assert!((learn_rate(None, 8.5) - 8.5).abs() < 0.01);
         let blended = learn_rate(Some(NOMINAL_PERCENT_PER_HOUR), 8.5);
-        let expected = 0.7 * NOMINAL_PERCENT_PER_HOUR + 0.3 * 8.5;
+        let expected = (1.0 - LEARN_ALPHA) * NOMINAL_PERCENT_PER_HOUR + LEARN_ALPHA * 8.5;
         assert!((blended - expected).abs() < 0.01, "got {blended}");
+        let mut slow = 4.0;
+        for _ in 0..10 {
+            slow = learn_rate(Some(slow), 10.0);
+        }
+        assert!(
+            slow < 6.0,
+            "ten samples must not erase history, got {slow}"
+        );
         assert_eq!(learn_rate(None, 80.0), 40.0);
         let health = health_pct(8.5);
         assert!((health - 39.2).abs() < 0.2, "got {health}");
         assert!(health_rate(Some(8.5), 3.0, None).is_some());
         assert!(health_rate(Some(8.5), 1.0, None).is_none());
+    }
+
+    #[test]
+    fn charge_gap_starts_a_new_discharge() {
+        let path = std::env::temp_dir().join(format!(
+            "cloud-flight-tray-test-{}-{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut tracker = DrainTracker {
+            samples: vec![
+                Sample { t: 0, p: 80.0 },
+                Sample { t: 600, p: 78.0 },
+            ],
+            session_start: Some(Sample { t: 0, p: 80.0 }),
+            learned_nominal_rate: Some(4.0),
+            was_charging: false,
+            path: path.clone(),
+        };
+        let learned_before = tracker.learned_nominal_rate;
+        tracker.record(78.0, true, true);
+        assert!(tracker.was_charging);
+        assert!(tracker.session_start.is_none());
+        assert_eq!(tracker.learned_nominal_rate, learned_before);
+
+        tracker.record(77.2, false, true);
+        assert!(!tracker.was_charging);
+        assert_eq!(tracker.samples.len(), 1);
+        assert!((tracker.samples[0].p - 77.2).abs() < 0.01);
+        assert!(tracker.session_start.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn duplicate_poll_does_not_learn_again() {
+        let path = std::env::temp_dir().join(format!(
+            "cloud-flight-tray-test-dup-{}-{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        let now = now_secs();
+        let mut tracker = DrainTracker {
+            samples: vec![
+                Sample {
+                    t: now - 3600,
+                    p: 90.0,
+                },
+                Sample {
+                    t: now - 60,
+                    p: 86.0,
+                },
+            ],
+            session_start: None,
+            learned_nominal_rate: Some(4.0),
+            was_charging: false,
+            path: path.clone(),
+        };
+        tracker.record(86.0, false, true);
+        let once = tracker.learned_nominal_rate;
+        tracker.record(86.0, false, true);
+        assert_eq!(tracker.learned_nominal_rate, once);
+        let _ = std::fs::remove_file(path);
     }
 }
