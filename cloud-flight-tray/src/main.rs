@@ -4,6 +4,7 @@ mod battery;
 mod drain;
 mod hid;
 mod icon;
+mod startup;
 
 use drain::{DrainStats, DrainTracker};
 use hid::{Connection, RawStatus};
@@ -11,7 +12,7 @@ use icon::{make_icon, IconKind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winit::application::ApplicationHandler;
 use winit::event::StartCause;
@@ -48,6 +49,7 @@ struct StatusItems {
     session: MenuItem,
     status: MenuItem,
     refresh: MenuItem,
+    startup: CheckMenuItem,
     quit: MenuItem,
 }
 
@@ -97,6 +99,7 @@ impl ApplicationHandler<UserEvent> for App {
         if cause != StartCause::Init || self.tray.is_some() {
             return;
         }
+        startup::ensure_default_enabled();
         let items = StatusItems {
             battery: MenuItem::new("Battery: —", false, None),
             drain: MenuItem::new("Drain: —", false, None),
@@ -104,6 +107,12 @@ impl ApplicationHandler<UserEvent> for App {
             session: MenuItem::new("Session: —", false, None),
             status: MenuItem::new("Status: looking for dongle…", false, None),
             refresh: MenuItem::new("Refresh", true, None),
+            startup: CheckMenuItem::new(
+                "Start with Windows",
+                true,
+                startup::is_enabled(),
+                None,
+            ),
             quit: MenuItem::new("Quit", true, None),
         };
         let menu = Menu::new();
@@ -114,6 +123,7 @@ impl ApplicationHandler<UserEvent> for App {
         let _ = menu.append(&items.status);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&items.refresh);
+        let _ = menu.append(&items.startup);
         let _ = menu.append(&items.quit);
 
         let tray = TrayIconBuilder::new()
@@ -148,6 +158,9 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.exit();
                     } else if event.id == items.refresh.id() {
                         let _ = self.cmd_tx.send(PollCmd::Refresh);
+                    } else if event.id == items.startup.id() {
+                        let enabled = startup::set_enabled(!items.startup.is_checked());
+                        items.startup.set_checked(enabled);
                     }
                 }
             }
