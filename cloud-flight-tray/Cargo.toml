@@ -1,0 +1,20 @@
+[package]
+name = "cloud-flight-tray"
+version = "0.1.0"
+edition = "2021"
+description = "Windows tray monitor for HyperX Cloud Flight headset battery"
+license = "MIT"
+
+[dependencies]
+hidapi = "2"
+image = { version = "0.25", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.21"
+winit = "0.30"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
