@@ -12,6 +12,8 @@ const NOMINAL_PERCENT_PER_HOUR: f32 = 100.0 / 30.0;
 const FULL_TRUST_DROP: f32 = 2.0;
 /// A jump larger than sensor noise starts a new discharge segment.
 const RECHARGE_JUMP: f32 = 4.0;
+/// Wall-clock silence longer than this is the headset or PC being off, not drain.
+const MAX_IDLE_GAP_SECS: i64 = 15 * 60;
 /// Per new sample. 0.02 keeps prior sessions for hours instead of washing them out in minutes.
 const LEARN_ALPHA: f32 = 0.02;
 const MAX_SAMPLES: usize = 4_000;
@@ -187,7 +189,9 @@ impl DrainTracker {
 fn discharge_segment(samples: &[Sample]) -> &[Sample] {
     let mut start = 0;
     for i in 1..samples.len() {
-        if samples[i].p - samples[i - 1].p > RECHARGE_JUMP {
+        let jumped = samples[i].p - samples[i - 1].p > RECHARGE_JUMP;
+        let idle = samples[i].t - samples[i - 1].t > MAX_IDLE_GAP_SECS;
+        if jumped || idle {
             start = i;
         }
     }
@@ -457,5 +461,33 @@ mod tests {
         tracker.record(86.0, false, true);
         assert_eq!(tracker.learned_nominal_rate, once);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn idle_gap_starts_a_fresh_segment() {
+        let gap = MAX_IDLE_GAP_SECS + 1;
+        let samples = vec![
+            Sample { t: 0, p: 80.0 },
+            Sample { t: 3600, p: 72.0 },
+            Sample { t: 3600 + gap, p: 71.5 },
+            Sample {
+                t: 3600 + gap + 600,
+                p: 70.0,
+            },
+        ];
+        let segment = discharge_segment(&samples);
+        assert_eq!(segment.len(), 2);
+        assert_eq!(segment[0].t, 3600 + gap);
+        let rate = net_rate(segment).unwrap();
+        assert!((rate - 9.0).abs() < 0.01, "got {rate}");
+
+        let continuous = vec![
+            Sample { t: 0, p: 80.0 },
+            Sample {
+                t: MAX_IDLE_GAP_SECS,
+                p: 78.0,
+            },
+        ];
+        assert_eq!(discharge_segment(&continuous).len(), 2);
     }
 }

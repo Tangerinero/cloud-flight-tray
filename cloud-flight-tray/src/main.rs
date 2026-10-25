@@ -332,7 +332,8 @@ fn publish(
     }
 
     let drain_stats = match (status.connection, status.percent, status.charging) {
-        (Connection::Connected, Some(percent), charging) => drain.record(percent, charging, true),
+        (Connection::Connected, _, true) => drain.record(0.0, true, true),
+        (Connection::Connected, Some(percent), false) => drain.record(percent, false, true),
         _ => drain.latest_stats(),
     };
 
