@@ -7,7 +7,7 @@ mod icon;
 mod startup;
 
 use drain::{DrainStats, DrainTracker};
-use hid::{Connection, QueryOutcome, RawStatus};
+use hid::{keep_measured_percent, Connection, QueryOutcome, RawStatus};
 use icon::{make_icon, IconKind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -21,6 +21,7 @@ use winit::window::WindowId;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const LINK_WAIT: Duration = Duration::from_millis(400);
+const MIN_STATUS_QUERY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 enum PollCmd {
@@ -31,7 +32,7 @@ enum PollCmd {
 #[derive(Debug, Clone)]
 struct HeadsetUpdate {
     connection: Connection,
-    charging: bool,
+    charging: Option<bool>,
     percent: Option<f32>,
     raw: Option<u16>,
     drain: DrainStats,
@@ -108,12 +109,7 @@ impl ApplicationHandler<UserEvent> for App {
             session: MenuItem::new("Session: —", false, None),
             status: MenuItem::new("Status: looking for dongle…", false, None),
             refresh: MenuItem::new("Refresh", true, None),
-            startup: CheckMenuItem::new(
-                "Start with Windows",
-                true,
-                startup::is_enabled(),
-                None,
-            ),
+            startup: CheckMenuItem::new("Start with Windows", true, startup::is_enabled(), None),
             quit: MenuItem::new("Quit", true, None),
         };
         let menu = Menu::new();
@@ -213,6 +209,7 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
         let mut power: Option<hidapi::HidDevice> = None;
         let mut status_dev: Option<hidapi::HidDevice> = None;
         let mut next_battery = std::time::Instant::now();
+        let mut last_status_query: Option<std::time::Instant> = None;
 
         loop {
             let mut poll_battery = false;
@@ -256,7 +253,7 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                             &mut drain,
                             RawStatus {
                                 connection: Connection::HeadsetOff,
-                                charging: false,
+                                charging: Some(false),
                                 percent: last_percent,
                                 raw: last_raw,
                             },
@@ -279,11 +276,14 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
             }
 
             if poll_battery || next_battery <= std::time::Instant::now() {
-                let outcome = if let Some(device) = status_dev.as_mut() {
-                    Some(hid::query_battery(device))
-                } else {
-                    None
-                };
+                if last_status_query.is_some_and(|started| started.elapsed() < MIN_STATUS_QUERY) {
+                    if next_battery <= std::time::Instant::now() {
+                        next_battery = std::time::Instant::now() + MIN_STATUS_QUERY;
+                    }
+                    continue;
+                }
+                last_status_query = Some(std::time::Instant::now());
+                let outcome = status_dev.as_mut().map(hid::query_battery);
                 match outcome {
                     Some(QueryOutcome::Timeout) => {}
                     Some(QueryOutcome::DeviceError) => {
@@ -308,34 +308,38 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                         } else if saw_power_off || reading.connection == Connection::HeadsetOff {
                             link = Connection::HeadsetOff;
                             reading.connection = Connection::HeadsetOff;
-                            reading.charging = false;
+                            reading.charging = Some(false);
                         } else if reading.connection == Connection::Connected {
                             link = Connection::Connected;
                         }
-                        publish(&proxy, &mut drain, reading, &mut last_percent, &mut last_raw);
-                    }
-                    None if power.is_some() || saw_power_off => {
                         publish(
                             &proxy,
                             &mut drain,
-                            RawStatus {
-                                connection: Connection::HeadsetOff,
-                                charging: false,
-                                percent: None,
-                                raw: None,
-                            },
+                            reading,
                             &mut last_percent,
                             &mut last_raw,
                         );
                     }
                     None => {
-                        publish(
-                            &proxy,
-                            &mut drain,
-                            RawStatus::disconnected(),
-                            &mut last_percent,
-                            &mut last_raw,
-                        );
+                        let connection =
+                            connection_when_status_missing(power.is_some(), saw_power_off, link);
+                        link = connection;
+                        let status = match connection {
+                            Connection::DongleMissing => RawStatus::disconnected(),
+                            Connection::HeadsetOff => RawStatus {
+                                connection,
+                                charging: Some(false),
+                                percent: last_percent,
+                                raw: last_raw,
+                            },
+                            Connection::Connected => RawStatus {
+                                connection,
+                                charging: None,
+                                percent: last_percent,
+                                raw: last_raw,
+                            },
+                        };
+                        publish(&proxy, &mut drain, status, &mut last_percent, &mut last_raw);
                     }
                 }
                 next_battery = std::time::Instant::now() + POLL_INTERVAL;
@@ -352,23 +356,25 @@ fn publish(
     last_raw: &mut Option<u16>,
 ) {
     if status.connection == Connection::Connected {
-        if status.percent.is_none() {
-            status.percent = *last_percent;
-            status.raw = status.raw.or(*last_raw);
-        } else {
-            *last_percent = status.percent;
+        let measured = status.percent;
+        status.percent = keep_measured_percent(*last_percent, measured);
+        if measured.is_some() {
+            *last_percent = measured;
             *last_raw = status.raw;
+        } else {
+            status.raw = status.raw.or(*last_raw);
         }
     } else if status.connection == Connection::HeadsetOff {
         status.percent = status.percent.or(*last_percent);
         status.raw = status.raw.or(*last_raw);
-        status.charging = false;
+        status.charging = Some(false);
     }
 
     let drain_stats = match (status.connection, status.percent, status.charging) {
-        (Connection::Connected, _, true) => drain.record(0.0, true, true),
-        (Connection::Connected, Some(percent), false) => drain.record(percent, false, true),
-        _ => drain.latest_stats(),
+        (Connection::Connected, _, Some(true)) => drain.record(0.0, true, true),
+        (Connection::Connected, Some(percent), Some(false)) => drain.record(percent, false, true),
+        (Connection::Connected, _, None) => drain.latest_stats(),
+        _ => drain.record(0.0, false, false),
     };
 
     let _ = proxy.send_event(UserEvent::Headset(HeadsetUpdate {
@@ -398,7 +404,6 @@ impl HidApiOrNone {
             self.inner = hidapi::HidApi::new().ok();
         }
     }
-
 }
 
 fn icon_kind(update: &HeadsetUpdate) -> IconKind {
@@ -406,7 +411,9 @@ fn icon_kind(update: &HeadsetUpdate) -> IconKind {
     match update.connection {
         Connection::DongleMissing => IconKind::Disconnected,
         Connection::HeadsetOff => IconKind::HeadsetOff,
-        Connection::Connected if update.charging => IconKind::Charging { percent: rounded },
+        Connection::Connected if update.charging == Some(true) => {
+            IconKind::Charging { percent: rounded }
+        }
         Connection::Connected => match rounded {
             Some(percent) => IconKind::Battery { percent },
             None => IconKind::Disconnected,
@@ -423,10 +430,10 @@ fn tooltip_text(update: &HeadsetUpdate) -> String {
         },
         Connection::Connected => {
             let level = match (update.charging, update.percent) {
-                (true, Some(p)) => format!("Connected, charging  |  {p:.1}%"),
-                (true, None) => "Connected, charging".to_string(),
-                (false, Some(p)) => format!("Connected  |  {p:.1}%"),
-                (false, None) => "Connected".to_string(),
+                (Some(true), Some(p)) => format!("⚡ {p:.1}%"),
+                (Some(true), None) => "⚡ —".to_string(),
+                (_, Some(p)) => format!("{p:.1}%"),
+                _ => "Connected".to_string(),
             };
             let drain = update
                 .drain
@@ -451,9 +458,15 @@ fn battery_line(update: &HeadsetUpdate) -> String {
     } else {
         ""
     };
+    let bolt = if update.charging == Some(true) {
+        "⚡ "
+    } else {
+        ""
+    };
     match (update.percent, update.raw) {
-        (Some(p), Some(raw)) => format!("Battery: {p:.1}%{suffix}  (raw {raw:#06x})"),
-        (Some(p), None) => format!("Battery: {p:.1}%{suffix}"),
+        (Some(p), Some(raw)) => format!("Battery: {bolt}{p:.1}%{suffix}  (raw {raw:#06x})"),
+        (Some(p), None) => format!("Battery: {bolt}{p:.1}%{suffix}"),
+        _ if update.charging == Some(true) => "Battery: ⚡ —".into(),
         _ => "Battery: —".into(),
     }
 }
@@ -486,8 +499,28 @@ fn status_line(update: &HeadsetUpdate) -> String {
     match update.connection {
         Connection::DongleMissing => "Headset: Dongle disconnected".into(),
         Connection::HeadsetOff => "Headset: Turned off".into(),
-        Connection::Connected if update.charging => "Headset: Connected, charging".into(),
+        Connection::Connected if update.charging == Some(true) => match update.percent {
+            Some(p) => format!("Headset: ⚡ {p:.1}%"),
+            None => "Headset: ⚡ —".into(),
+        },
         Connection::Connected => "Headset: Connected".into(),
+    }
+}
+
+fn connection_when_status_missing(
+    power_open: bool,
+    saw_power_off: bool,
+    link: Connection,
+) -> Connection {
+    if saw_power_off {
+        Connection::HeadsetOff
+    } else if power_open {
+        match link {
+            Connection::DongleMissing => Connection::Connected,
+            other => other,
+        }
+    } else {
+        Connection::DongleMissing
     }
 }
 
@@ -498,5 +531,41 @@ fn format_duration(secs: u64) -> String {
         format!("{hours}h {mins}m")
     } else {
         format!("{mins}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_status_interface_is_not_headset_off() {
+        assert_eq!(
+            connection_when_status_missing(true, false, Connection::Connected),
+            Connection::Connected
+        );
+        assert_ne!(
+            connection_when_status_missing(true, false, Connection::Connected),
+            Connection::HeadsetOff
+        );
+        assert_eq!(
+            connection_when_status_missing(true, true, Connection::Connected),
+            Connection::HeadsetOff
+        );
+        assert_eq!(
+            connection_when_status_missing(false, false, Connection::Connected),
+            Connection::DongleMissing
+        );
+    }
+
+    #[test]
+    fn unknown_charging_is_not_confirmed() {
+        let status = RawStatus {
+            connection: Connection::Connected,
+            charging: None,
+            percent: Some(65.0),
+            raw: Some(3800),
+        };
+        assert_ne!(status.charging, Some(true));
     }
 }

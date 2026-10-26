@@ -19,8 +19,9 @@ pub enum BatteryReading {
     Percent { percent: f32, raw: u16 },
 }
 
-pub fn is_charging(upper: u8, lower: u8) -> bool {
-    (upper == 0x10 && lower >= 20) || upper >= 0x11
+pub fn is_charging(upper: u8, _lower: u8) -> bool {
+    // Discharge samples top out at raw 3970 (upper byte 0x0F). 0x10 and above is the charge range.
+    upper >= 0x10
 }
 
 pub fn parse_battery_bytes(upper: u8, lower: u8) -> BatteryReading {
@@ -96,8 +97,16 @@ mod tests {
     #[test]
     fn charging_detection() {
         assert!(is_charging(0x10, 20));
+        assert!(is_charging(0x10, 0));
         assert!(is_charging(0x11, 0));
         assert!(!is_charging(0x0E, 200));
+        assert_eq!(
+            parse_battery_bytes(0x10, 0),
+            BatteryReading::Charging {
+                full: false,
+                raw: 0x1000
+            }
+        );
         assert_eq!(
             parse_battery_bytes(0x10, 0x20),
             BatteryReading::Charging {

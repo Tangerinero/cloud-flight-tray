@@ -40,6 +40,10 @@ struct HistoryFile {
     learned_nominal_rate: Option<f32>,
     #[serde(default)]
     was_charging: bool,
+    #[serde(default)]
+    was_disconnected: bool,
+    #[serde(default)]
+    segment_origin: Option<i64>,
 }
 
 pub struct DrainTracker {
@@ -47,6 +51,9 @@ pub struct DrainTracker {
     session_start: Option<Sample>,
     learned_nominal_rate: Option<f32>,
     was_charging: bool,
+    was_disconnected: bool,
+    segment_origin: Option<i64>,
+    last_persist_error: Option<String>,
     path: PathBuf,
 }
 
@@ -62,6 +69,9 @@ impl DrainTracker {
             session_start: None,
             learned_nominal_rate: loaded.learned_nominal_rate,
             was_charging: loaded.was_charging,
+            was_disconnected: loaded.was_disconnected,
+            segment_origin: loaded.segment_origin,
+            last_persist_error: None,
             path,
         };
         tracker.prune(now_secs());
@@ -70,11 +80,17 @@ impl DrainTracker {
 
     pub fn record(&mut self, percent: f32, charging: bool, connected: bool) -> DrainStats {
         let t = now_secs();
-        if !connected || charging {
-            if charging {
-                self.was_charging = true;
-                self.session_start = None;
-            }
+        if !connected {
+            self.was_disconnected = true;
+            self.session_start = None;
+            self.prune(t);
+            self.persist();
+            let current = self.samples.last().map(|s| s.p);
+            return self.stats(current, t);
+        }
+        if charging {
+            self.was_charging = true;
+            self.session_start = None;
             self.prune(t);
             self.persist();
             let current = self.samples.last().map(|s| s.p);
@@ -85,15 +101,22 @@ impl DrainTracker {
             self.samples.clear();
             self.was_charging = false;
             self.session_start = None;
+            self.segment_origin = None;
+        }
+        if self.was_disconnected {
+            self.segment_origin = Some(t);
+            self.was_disconnected = false;
+            self.session_start = None;
         }
 
         let sample = Sample { t, p: percent };
         if self.session_start.is_none() {
             self.session_start = Some(sample);
         }
-        let should_push = self.samples.last().map_or(true, |s| {
-            t > s.t && ((percent - s.p).abs() >= 0.01 || t - s.t >= 50)
-        });
+        let should_push = self
+            .samples
+            .last()
+            .is_none_or(|s| t > s.t && ((percent - s.p).abs() >= 0.01 || t - s.t >= 50));
         if should_push {
             self.samples.push(sample);
             self.maybe_learn(t);
@@ -118,17 +141,30 @@ impl DrainTracker {
         }
     }
 
-    fn persist(&self) {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+    fn persist(&mut self) {
         let payload = HistoryFile {
             samples: self.samples.clone(),
             learned_nominal_rate: self.learned_nominal_rate,
             was_charging: self.was_charging,
+            was_disconnected: self.was_disconnected,
+            segment_origin: self.segment_origin,
         };
-        if let Ok(json) = serde_json::to_string(&payload) {
-            let _ = fs::write(&self.path, json);
+        let error = (|| -> Result<(), String> {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("create {}: {err}", parent.display()))?;
+            }
+            let json =
+                serde_json::to_string(&payload).map_err(|err| format!("encode history: {err}"))?;
+            fs::write(&self.path, json)
+                .map_err(|err| format!("write {}: {err}", self.path.display()))
+        })()
+        .err();
+        if error != self.last_persist_error {
+            if let Some(message) = &error {
+                eprintln!("cloud-flight-tray: {message}");
+            }
+            self.last_persist_error = error;
         }
     }
 
@@ -148,7 +184,7 @@ impl DrainTracker {
             .copied()
             .filter(|s| s.t >= window_start)
             .collect();
-        let segment = discharge_segment(&window);
+        let segment = discharge_segment(&window, self.segment_origin);
         let measured = net_rate(segment);
         let drop = net_drop(segment);
         let nominal = self
@@ -162,8 +198,8 @@ impl DrainTracker {
                 stats.remaining_secs = Some((hours * 3600.0).max(0.0) as u64);
             }
         }
-        stats.estimated_health_pct = health_rate(measured, drop, self.learned_nominal_rate)
-            .map(health_pct);
+        stats.estimated_health_pct =
+            health_rate(measured, drop, self.learned_nominal_rate).map(health_pct);
         stats
     }
 
@@ -175,7 +211,7 @@ impl DrainTracker {
             .copied()
             .filter(|s| s.t >= window_start)
             .collect();
-        let segment = discharge_segment(&window);
+        let segment = discharge_segment(&window, self.segment_origin);
         let Some(measured) = net_rate(segment) else {
             return;
         };
@@ -186,9 +222,15 @@ impl DrainTracker {
     }
 }
 
-fn discharge_segment(samples: &[Sample]) -> &[Sample] {
-    let mut start = 0;
-    for i in 1..samples.len() {
+fn discharge_segment(samples: &[Sample], origin: Option<i64>) -> &[Sample] {
+    let mut start = match origin {
+        Some(origin) => samples
+            .iter()
+            .position(|sample| sample.t >= origin)
+            .unwrap_or(samples.len()),
+        None => 0,
+    };
+    for i in (start + 1)..samples.len() {
         let jumped = samples[i].p - samples[i - 1].p > RECHARGE_JUMP;
         let idle = samples[i].t - samples[i - 1].t > MAX_IDLE_GAP_SECS;
         if jumped || idle {
@@ -233,7 +275,7 @@ fn median_percent(samples: &[Sample]) -> f32 {
     let mut vals: Vec<f32> = samples.iter().map(|s| s.p).collect();
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = vals.len() / 2;
-    if vals.len() % 2 == 0 {
+    if vals.len().is_multiple_of(2) {
         (vals[mid - 1] + vals[mid]) / 2.0
     } else {
         vals[mid]
@@ -315,10 +357,7 @@ mod tests {
 
     #[test]
     fn slope_detects_drain() {
-        let samples = [
-            Sample { t: 0, p: 80.0 },
-            Sample { t: 3600, p: 76.0 },
-        ];
+        let samples = [Sample { t: 0, p: 80.0 }, Sample { t: 3600, p: 76.0 }];
         let rate = slope_percent_per_hour(&samples);
         assert!((rate - 4.0).abs() < 0.01, "got {rate}");
     }
@@ -352,8 +391,8 @@ mod tests {
             });
         }
         let noisy = [
-            97.5, 100.0, 97.5, 97.0, 99.0, 94.75, 97.5, 95.0, 94.25, 93.5, 92.0, 90.5, 89.5,
-            88.5, 87.5, 86.5, 85.7,
+            97.5, 100.0, 97.5, 97.0, 99.0, 94.75, 97.5, 95.0, 94.25, 93.5, 92.0, 90.5, 89.5, 88.5,
+            87.5, 86.5, 85.7,
         ];
         for (i, p) in noisy.iter().enumerate() {
             samples.push(Sample {
@@ -390,10 +429,7 @@ mod tests {
         for _ in 0..10 {
             slow = learn_rate(Some(slow), 10.0);
         }
-        assert!(
-            slow < 6.0,
-            "ten samples must not erase history, got {slow}"
-        );
+        assert!(slow < 6.0, "ten samples must not erase history, got {slow}");
         assert_eq!(learn_rate(None, 80.0), 40.0);
         let health = health_pct(8.5);
         assert!((health - 39.2).abs() < 0.2, "got {health}");
@@ -409,13 +445,13 @@ mod tests {
             now_secs()
         ));
         let mut tracker = DrainTracker {
-            samples: vec![
-                Sample { t: 0, p: 80.0 },
-                Sample { t: 600, p: 78.0 },
-            ],
+            samples: vec![Sample { t: 0, p: 80.0 }, Sample { t: 600, p: 78.0 }],
             session_start: Some(Sample { t: 0, p: 80.0 }),
             learned_nominal_rate: Some(4.0),
             was_charging: false,
+            was_disconnected: false,
+            segment_origin: None,
+            last_persist_error: None,
             path: path.clone(),
         };
         let learned_before = tracker.learned_nominal_rate;
@@ -454,6 +490,9 @@ mod tests {
             session_start: None,
             learned_nominal_rate: Some(4.0),
             was_charging: false,
+            was_disconnected: false,
+            segment_origin: None,
+            last_persist_error: None,
             path: path.clone(),
         };
         tracker.record(86.0, false, true);
@@ -469,13 +508,16 @@ mod tests {
         let samples = vec![
             Sample { t: 0, p: 80.0 },
             Sample { t: 3600, p: 72.0 },
-            Sample { t: 3600 + gap, p: 71.5 },
+            Sample {
+                t: 3600 + gap,
+                p: 71.5,
+            },
             Sample {
                 t: 3600 + gap + 600,
                 p: 70.0,
             },
         ];
-        let segment = discharge_segment(&samples);
+        let segment = discharge_segment(&samples, None);
         assert_eq!(segment.len(), 2);
         assert_eq!(segment[0].t, 3600 + gap);
         let rate = net_rate(segment).unwrap();
@@ -488,6 +530,75 @@ mod tests {
                 p: 78.0,
             },
         ];
-        assert_eq!(discharge_segment(&continuous).len(), 2);
+        assert_eq!(discharge_segment(&continuous, None).len(), 2);
+    }
+
+    #[test]
+    fn disconnect_gap_is_excluded_from_the_active_segment() {
+        let now = 10_000;
+        let samples = vec![
+            Sample {
+                t: now - 120,
+                p: 80.0,
+            },
+            Sample {
+                t: now - 60,
+                p: 79.0,
+            },
+            Sample { t: now, p: 78.0 },
+            Sample {
+                t: now + 600,
+                p: 76.0,
+            },
+        ];
+        let segment = discharge_segment(&samples, Some(now));
+        assert_eq!(segment.len(), 2);
+        assert_eq!(segment[0].t, now);
+        let rate = net_rate(segment).unwrap();
+        assert!((rate - 12.0).abs() < 0.01, "got {rate}");
+        assert_eq!(samples.len(), 4);
+
+        let path = std::env::temp_dir().join(format!(
+            "cloud-flight-tray-test-gap-{}-{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        let wall = now_secs();
+        let mut tracker = DrainTracker {
+            samples: vec![
+                Sample {
+                    t: wall - 90,
+                    p: 80.0,
+                },
+                Sample {
+                    t: wall - 30,
+                    p: 79.0,
+                },
+            ],
+            session_start: Some(Sample {
+                t: wall - 90,
+                p: 80.0,
+            }),
+            learned_nominal_rate: Some(4.0),
+            was_charging: false,
+            was_disconnected: false,
+            segment_origin: None,
+            last_persist_error: None,
+            path: path.clone(),
+        };
+        tracker.record(0.0, false, false);
+        assert!(tracker.was_disconnected);
+        assert!(tracker.session_start.is_none());
+        assert_eq!(tracker.samples.len(), 2);
+        tracker.record(78.0, false, true);
+        assert!(!tracker.was_disconnected);
+        assert_eq!(tracker.samples.len(), 3);
+        assert_eq!(
+            tracker.segment_origin,
+            tracker.samples.last().map(|sample| sample.t)
+        );
+        let stats = tracker.latest_stats();
+        assert!(stats.session_secs.unwrap_or(999) < 5);
+        let _ = std::fs::remove_file(path);
     }
 }
