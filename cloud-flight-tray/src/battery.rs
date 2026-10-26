@@ -15,7 +15,7 @@ const PERCENTAGES: [f32; 20] = [
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BatteryReading {
-    Charging,
+    Charging { full: bool, raw: u16 },
     Percent { percent: f32, raw: u16 },
 }
 
@@ -24,10 +24,11 @@ pub fn is_charging(upper: u8, lower: u8) -> bool {
 }
 
 pub fn parse_battery_bytes(upper: u8, lower: u8) -> BatteryReading {
-    if is_charging(upper, lower) {
-        return BatteryReading::Charging;
-    }
     let raw = ((upper as u16) << 8) | (lower as u16);
+    if is_charging(upper, lower) {
+        let full = upper == 0x10 && lower >= 200;
+        return BatteryReading::Charging { full, raw };
+    }
     BatteryReading::Percent {
         percent: interpolate_percent(raw),
         raw,
@@ -99,7 +100,17 @@ mod tests {
         assert!(!is_charging(0x0E, 200));
         assert_eq!(
             parse_battery_bytes(0x10, 0x20),
-            BatteryReading::Charging
+            BatteryReading::Charging {
+                full: false,
+                raw: 0x1020
+            }
+        );
+        assert_eq!(
+            parse_battery_bytes(0x10, 200),
+            BatteryReading::Charging {
+                full: true,
+                raw: 0x10C8
+            }
         );
         match parse_battery_bytes(0x0E, 0xC8) {
             BatteryReading::Percent { percent, raw } => {

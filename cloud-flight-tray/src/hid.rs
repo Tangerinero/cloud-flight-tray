@@ -22,7 +22,7 @@ const GET_BATTERY: [u8; 20] = {
     pkt
 };
 
-const POLL_READ_TIMEOUT: i32 = 250;
+const POLL_READ_TIMEOUT: i32 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Connection {
@@ -62,33 +62,26 @@ pub fn open_power_device(api: &HidApi) -> Option<HidDevice> {
     open_matching(api, |info| info.usage_page() == POWER_USAGE_PAGE)
 }
 
-pub fn query_battery(device: &mut HidDevice) -> RawStatus {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QueryOutcome {
+    Status(RawStatus),
+    Timeout,
+    DeviceError,
+}
+
+pub fn query_battery(device: &mut HidDevice) -> QueryOutcome {
     if send_status_request(device).is_err() {
-        return RawStatus::disconnected();
+        return QueryOutcome::DeviceError;
     }
 
     let mut buf = [0u8; 64];
-    if let Ok(n) = device.read_timeout(&mut buf, POLL_READ_TIMEOUT) {
-        if n > 0 {
-            if let Some(parsed) = parse_report(&buf[..n]) {
-                return parsed;
-            }
-        }
-    }
-
-    let mut feature = [0u8; 64];
-    feature[0] = 0x21;
-    if let Ok(n) = device.get_feature_report(&mut feature) {
-        if let Some(parsed) = parse_report(&feature[..n.max(5)]) {
-            return parsed;
-        }
-    }
-
-    RawStatus {
-        connection: Connection::HeadsetOff,
-        charging: false,
-        percent: None,
-        raw: None,
+    match device.read_timeout(&mut buf, POLL_READ_TIMEOUT) {
+        Ok(0) => QueryOutcome::Timeout,
+        Ok(n) => match parse_report(&buf[..n]) {
+            Some(status) => QueryOutcome::Status(status),
+            None => QueryOutcome::Timeout,
+        },
+        Err(_) => QueryOutcome::DeviceError,
     }
 }
 
@@ -115,11 +108,7 @@ fn open_matching(api: &HidApi, pred: impl Fn(&hidapi::DeviceInfo) -> bool) -> Op
 }
 
 fn send_status_request(device: &mut HidDevice) -> hidapi::HidResult<()> {
-    if device.send_feature_report(&GET_BATTERY).is_ok() {
-        std::thread::sleep(Duration::from_millis(40));
-        return Ok(());
-    }
-    device.write(&GET_BATTERY).map(|_| ())?;
+    device.write(&GET_BATTERY)?;
     std::thread::sleep(Duration::from_millis(40));
     Ok(())
 }
@@ -150,11 +139,11 @@ pub fn parse_report(data: &[u8]) -> Option<RawStatus> {
     let (upper, lower) = (data[3], data[4]);
 
     match parse_battery_bytes(upper, lower) {
-        BatteryReading::Charging => Some(RawStatus {
+        BatteryReading::Charging { full, raw } => Some(RawStatus {
             connection: Connection::Connected,
             charging: true,
-            percent: None,
-            raw: Some(((upper as u16) << 8) | lower as u16),
+            percent: if full { Some(100.0) } else { None },
+            raw: Some(raw),
         }),
         BatteryReading::Percent { percent, raw } => Some(RawStatus {
             connection: Connection::Connected,
@@ -215,5 +204,16 @@ mod tests {
         let s = parse_report(&pkt).unwrap();
         assert!(s.charging);
         assert!(s.percent.is_none());
+        assert_eq!(s.raw, Some(0x1020));
+    }
+
+    #[test]
+    fn parse_full_charge() {
+        let pkt = [0x21, 0xFF, 0x05, 0x10, 0xC8];
+        let s = parse_report(&pkt).unwrap();
+        assert!(s.charging);
+        assert_eq!(s.percent, Some(100.0));
+        assert_eq!(s.raw, Some(0x10C8));
+        assert_eq!(s.connection, Connection::Connected);
     }
 }

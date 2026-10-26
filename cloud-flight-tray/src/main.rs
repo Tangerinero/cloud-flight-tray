@@ -7,7 +7,7 @@ mod icon;
 mod startup;
 
 use drain::{DrainStats, DrainTracker};
-use hid::{Connection, RawStatus};
+use hid::{Connection, QueryOutcome, RawStatus};
 use icon::{make_icon, IconKind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -279,31 +279,65 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
             }
 
             if poll_battery || next_battery <= std::time::Instant::now() {
-                let mut reading = if let Some(device) = status_dev.as_mut() {
-                    hid::query_battery(device)
-                } else if power.is_some() || saw_power_off {
-                    RawStatus {
-                        connection: Connection::HeadsetOff,
-                        charging: false,
-                        percent: None,
-                        raw: None,
-                    }
+                let outcome = if let Some(device) = status_dev.as_mut() {
+                    Some(hid::query_battery(device))
                 } else {
-                    RawStatus::disconnected()
+                    None
                 };
-                if reading.connection == Connection::DongleMissing {
-                    status_dev = None;
-                    if power.is_none() {
-                        link = Connection::DongleMissing;
+                match outcome {
+                    Some(QueryOutcome::Timeout) => {}
+                    Some(QueryOutcome::DeviceError) => {
+                        status_dev = None;
+                        if power.is_none() && !saw_power_off {
+                            link = Connection::DongleMissing;
+                            publish(
+                                &proxy,
+                                &mut drain,
+                                RawStatus::disconnected(),
+                                &mut last_percent,
+                                &mut last_raw,
+                            );
+                        }
                     }
-                } else if saw_power_off || reading.connection == Connection::HeadsetOff {
-                    link = Connection::HeadsetOff;
-                    reading.connection = Connection::HeadsetOff;
-                    reading.charging = false;
-                } else if reading.connection == Connection::Connected {
-                    link = Connection::Connected;
+                    Some(QueryOutcome::Status(mut reading)) => {
+                        if reading.connection == Connection::DongleMissing {
+                            status_dev = None;
+                            if power.is_none() {
+                                link = Connection::DongleMissing;
+                            }
+                        } else if saw_power_off || reading.connection == Connection::HeadsetOff {
+                            link = Connection::HeadsetOff;
+                            reading.connection = Connection::HeadsetOff;
+                            reading.charging = false;
+                        } else if reading.connection == Connection::Connected {
+                            link = Connection::Connected;
+                        }
+                        publish(&proxy, &mut drain, reading, &mut last_percent, &mut last_raw);
+                    }
+                    None if power.is_some() || saw_power_off => {
+                        publish(
+                            &proxy,
+                            &mut drain,
+                            RawStatus {
+                                connection: Connection::HeadsetOff,
+                                charging: false,
+                                percent: None,
+                                raw: None,
+                            },
+                            &mut last_percent,
+                            &mut last_raw,
+                        );
+                    }
+                    None => {
+                        publish(
+                            &proxy,
+                            &mut drain,
+                            RawStatus::disconnected(),
+                            &mut last_percent,
+                            &mut last_raw,
+                        );
+                    }
                 }
-                publish(&proxy, &mut drain, reading, &mut last_percent, &mut last_raw);
                 next_battery = std::time::Instant::now() + POLL_INTERVAL;
             }
         }
