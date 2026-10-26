@@ -70,19 +70,34 @@ pub enum QueryOutcome {
 }
 
 pub fn query_battery(device: &mut HidDevice) -> QueryOutcome {
+    let mut flush_buf = [0u8; 64];
+    while let Ok(n) = device.read_timeout(&mut flush_buf, 0) {
+        if n == 0 {
+            break;
+        }
+    }
+
     if send_status_request(device).is_err() {
         return QueryOutcome::DeviceError;
     }
 
+    let deadline = std::time::Instant::now() + Duration::from_millis(POLL_READ_TIMEOUT as u64);
     let mut buf = [0u8; 64];
-    match device.read_timeout(&mut buf, POLL_READ_TIMEOUT) {
-        Ok(0) => QueryOutcome::Timeout,
-        Ok(n) => match parse_report(&buf[..n]) {
-            Some(status) => QueryOutcome::Status(status),
-            None => QueryOutcome::Timeout,
-        },
-        Err(_) => QueryOutcome::DeviceError,
+
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let timeout_ms = (remaining.as_millis() as i32).max(1);
+        match device.read_timeout(&mut buf, timeout_ms) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(status) = parse_report(&buf[..n]) {
+                    return QueryOutcome::Status(status);
+                }
+            }
+            Err(_) => return QueryOutcome::DeviceError,
+        }
     }
+
+    QueryOutcome::Timeout
 }
 
 /// Power on/off arrives as a 2-byte input report on the power interface.
@@ -137,6 +152,14 @@ pub fn parse_report(data: &[u8]) -> Option<RawStatus> {
     }
 
     let (upper, lower) = (data[3], data[4]);
+    if upper == 0 && lower == 0 {
+        return Some(RawStatus {
+            connection: Connection::HeadsetOff,
+            charging: false,
+            percent: None,
+            raw: None,
+        });
+    }
 
     match parse_battery_bytes(upper, lower) {
         BatteryReading::Charging { full, raw } => Some(RawStatus {
@@ -170,6 +193,15 @@ mod tests {
     fn parse_power_off() {
         let s = parse_report(&[0x64, 0x03]).unwrap();
         assert_eq!(s.connection, Connection::HeadsetOff);
+    }
+
+    #[test]
+    fn zero_status_is_headset_off() {
+        let s = parse_report(&[0x21, 0xFF, 0x05, 0x00, 0x00]).unwrap();
+        assert_eq!(s.connection, Connection::HeadsetOff);
+        assert!(!s.charging);
+        assert!(s.percent.is_none());
+        assert!(s.raw.is_none());
     }
 
     #[test]
