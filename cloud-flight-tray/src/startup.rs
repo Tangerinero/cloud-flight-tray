@@ -6,16 +6,10 @@ const PREF_KEY: &str = r"Software\cloud-flight-tray";
 const RUN_VALUE: &str = "CloudFlightTray";
 const PREF_VALUE: &str = "start_with_windows";
 
-/// Turn startup on the first time this setting exists, and keep the Run path current.
+/// Keep the Run path current when startup was opted in. First launch does not write the Run key.
 pub fn ensure_default_enabled() {
-    match read_pref() {
-        None => {
-            let _ = set_enabled(true);
-        }
-        Some(true) => {
-            let _ = write_run_entry();
-        }
-        Some(false) => {}
+    if read_pref() == Some(true) {
+        let _ = write_run_entry();
     }
 }
 

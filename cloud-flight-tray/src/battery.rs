@@ -7,6 +7,11 @@ const THRESHOLDS: [u16; 20] = [
 
 /// Headset hardware cuts off near 3.20 V, not at a raw value of 0.
 const CUTOFF_RAW: u16 = 3200;
+/// Assumption, unverified: a discharge sample stays below 4096 (upper byte 0x0F).
+const CHARGING_UPPER_MIN: u8 = 0x10;
+/// Assumption, unverified: full while charging is upper 0x10 and low byte >= 200.
+const FULL_CHARGE_UPPER: u8 = 0x10;
+const FULL_CHARGE_LOWER_MIN: u8 = 200;
 
 const PERCENTAGES: [f32; 20] = [
     5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0,
@@ -21,14 +26,20 @@ pub enum BatteryReading {
 
 pub fn is_charging(upper: u8, _lower: u8) -> bool {
     // Discharge samples top out at raw 3970 (upper byte 0x0F). 0x10 and above is the charge range.
-    upper >= 0x10
+    upper >= CHARGING_UPPER_MIN
+}
+
+pub fn is_full_charge(raw: u16) -> bool {
+    (raw >> 8) as u8 == FULL_CHARGE_UPPER && raw as u8 >= FULL_CHARGE_LOWER_MIN
 }
 
 pub fn parse_battery_bytes(upper: u8, lower: u8) -> BatteryReading {
     let raw = ((upper as u16) << 8) | (lower as u16);
     if is_charging(upper, lower) {
-        let full = upper == 0x10 && lower >= 200;
-        return BatteryReading::Charging { full, raw };
+        return BatteryReading::Charging {
+            full: is_full_charge(raw),
+            raw,
+        };
     }
     BatteryReading::Percent {
         percent: interpolate_percent(raw),
@@ -37,6 +48,7 @@ pub fn parse_battery_bytes(upper: u8, lower: u8) -> BatteryReading {
 }
 
 pub fn interpolate_percent(raw: u16) -> f32 {
+    // Only path to 100%. Unverified; log raw bytes before changing THRESHOLDS.
     if raw >= *THRESHOLDS.last().unwrap() {
         return 100.0;
     }

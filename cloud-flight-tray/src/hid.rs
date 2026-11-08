@@ -95,7 +95,14 @@ pub fn query_battery(device: &mut HidDevice) -> QueryOutcome {
         match device.read_timeout(&mut buf, timeout_ms) {
             Ok(0) => break,
             Ok(n) => {
-                if let Some(status) = parse_report(&buf[..n]) {
+                let status = parse_report(&buf[..n]);
+                log_line(&format!(
+                    "{} bytes={:02x?} parsed={:?}",
+                    unix_secs(),
+                    &buf[..n],
+                    status
+                ));
+                if let Some(status) = status {
                     return QueryOutcome::Status(status);
                 }
             }
@@ -106,17 +113,21 @@ pub fn query_battery(device: &mut HidDevice) -> QueryOutcome {
     QueryOutcome::Timeout
 }
 
-/// Power on/off arrives as a 2-byte input report on the power interface.
+/// Power on/off is a 2-byte 0x64 report. A 0x21 status report on this handle is not a connect event.
 pub fn read_power(
     device: &mut HidDevice,
     timeout_ms: i32,
 ) -> hidapi::HidResult<Option<Connection>> {
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 64];
     let n = device.read_timeout(&mut buf, timeout_ms)?;
-    if n < 2 {
-        return Ok(None);
+    Ok(power_event(&buf[..n]))
+}
+
+fn power_event(buf: &[u8]) -> Option<Connection> {
+    if buf.len() < 2 || buf[0] != 0x64 {
+        return None;
     }
-    Ok(parse_report(&buf[..n]).map(|status| status.connection))
+    parse_report(buf).map(|status| status.connection)
 }
 
 fn open_matching(api: &HidApi, pred: impl Fn(&hidapi::DeviceInfo) -> bool) -> Option<HidDevice> {
@@ -125,10 +136,46 @@ fn open_matching(api: &HidApi, pred: impl Fn(&hidapi::DeviceInfo) -> bool) -> Op
             continue;
         }
         if let Ok(dev) = api.open_path(info.path()) {
+            log_line(&format!(
+                "{} open vid={:04x} pid={:04x} usage_page={:#06x} usage={:#06x}",
+                unix_secs(),
+                info.vendor_id(),
+                info.product_id(),
+                info.usage_page(),
+                info.usage()
+            ));
             return Some(dev);
         }
     }
     None
+}
+
+fn log_line(line: &str) {
+    use std::io::Write;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let path = exe.with_file_name("cloud-flight-tray.log");
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn send_status_request(device: &mut HidDevice) -> hidapi::HidResult<()> {
@@ -210,6 +257,15 @@ mod tests {
     #[test]
     fn unknown_header_is_ignored() {
         assert!(parse_report(&[0x01, 0x02, 0x03, 0x0E, 0xC8]).is_none());
+    }
+
+    #[test]
+    fn power_handle_ignores_status_reports() {
+        assert_eq!(power_event(&[0x64, 0x01]), Some(Connection::Connected));
+        assert_eq!(power_event(&[0x64, 0x03]), Some(Connection::HeadsetOff));
+        assert_eq!(power_event(&[0x21, 0xFF, 0x05, 0x0E, 200]), None);
+        assert_eq!(power_event(&[0x21, 0xFF, 0x05, 0x10, 0x20]), None);
+        assert_eq!(power_event(&[0x64]), None);
     }
 
     #[test]

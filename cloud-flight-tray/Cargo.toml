@@ -2,6 +2,7 @@
 name = "cloud-flight-tray"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Windows tray monitor for HyperX Cloud Flight headset battery"
 license = "MIT"
 

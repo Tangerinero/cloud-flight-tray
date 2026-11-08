@@ -156,8 +156,19 @@ impl DrainTracker {
             }
             let json =
                 serde_json::to_string(&payload).map_err(|err| format!("encode history: {err}"))?;
-            fs::write(&self.path, json)
-                .map_err(|err| format!("write {}: {err}", self.path.display()))
+            let tmp = self.path.with_extension("json.tmp");
+            fs::write(&tmp, json).map_err(|err| format!("write {}: {err}", tmp.display()))?;
+            // Retry if this toolchain's rename will not replace an existing file.
+            if let Err(err) = fs::rename(&tmp, &self.path) {
+                if !self.path.exists() {
+                    return Err(format!("rename {}: {err}", self.path.display()));
+                }
+                fs::remove_file(&self.path)
+                    .map_err(|err| format!("replace {}: {err}", self.path.display()))?;
+                fs::rename(&tmp, &self.path)
+                    .map_err(|err| format!("rename {}: {err}", self.path.display()))?;
+            }
+            Ok(())
         })()
         .err();
         if error != self.last_persist_error {
@@ -599,6 +610,39 @@ mod tests {
         );
         let stats = tracker.latest_stats();
         assert!(stats.session_secs.unwrap_or(999) < 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persist_replaces_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cloud-flight-tray-test-persist-{}-{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut tracker = DrainTracker {
+            samples: vec![Sample { t: 1, p: 50.0 }],
+            session_start: None,
+            learned_nominal_rate: None,
+            was_charging: false,
+            was_disconnected: false,
+            segment_origin: None,
+            last_persist_error: None,
+            path: path.clone(),
+        };
+        tracker.persist();
+        tracker.samples.push(Sample { t: 2, p: 49.0 });
+        tracker.persist();
+        assert!(
+            tracker.last_persist_error.is_none(),
+            "{:?}",
+            tracker.last_persist_error
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let loaded: HistoryFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(loaded.samples.len(), 2);
+        assert!((loaded.samples[1].p - 49.0).abs() < 0.01);
+        assert!(!path.with_extension("json.tmp").exists());
         let _ = std::fs::remove_file(path);
     }
 }
