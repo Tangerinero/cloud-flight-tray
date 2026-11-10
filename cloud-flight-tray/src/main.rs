@@ -10,6 +10,7 @@ use drain::{DrainStats, DrainTracker};
 use hid::{keep_measured_percent, Connection, QueryOutcome, RawStatus};
 use icon::{make_icon, IconKind};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -25,6 +26,62 @@ const CHARGING_POLL_INTERVAL: Duration = Duration::from_secs(300);
 const ENUM_INTERVAL: Duration = Duration::from_secs(3);
 const LINK_WAIT: Duration = Duration::from_millis(400);
 const MIN_STATUS_QUERY: Duration = Duration::from_secs(1);
+const CLOSED_RECHECK: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+struct Experiment {
+    no_query: bool,
+    no_status: bool,
+    no_power: bool,
+    no_hid: bool,
+    no_connect_query: bool,
+    close_when_charging: bool,
+}
+
+impl Experiment {
+    fn from_env() -> Self {
+        Self {
+            no_query: env_on("CFT_NO_QUERY"),
+            no_status: env_on("CFT_NO_STATUS"),
+            no_power: env_on("CFT_NO_POWER"),
+            no_hid: env_on("CFT_NO_HID"),
+            no_connect_query: env_on("CFT_NO_CONNECT_QUERY"),
+            close_when_charging: env_on("CFT_CLOSE_WHEN_CHARGING"),
+        }
+    }
+
+    fn label(&self) -> String {
+        let mut on = Vec::new();
+        if self.no_hid {
+            on.push("NO_HID");
+        }
+        if self.no_query {
+            on.push("NO_QUERY");
+        }
+        if self.no_status {
+            on.push("NO_STATUS");
+        }
+        if self.no_power {
+            on.push("NO_POWER");
+        }
+        if self.no_connect_query {
+            on.push("NO_CONNECT_QUERY");
+        }
+        if self.close_when_charging {
+            on.push("CLOSE_WHEN_CHARGING");
+        }
+        on.join(",")
+    }
+}
+
+fn env_on(name: &str) -> bool {
+    std::env::var(name).ok().as_deref() == Some("1")
+}
+
+fn experiment() -> &'static Experiment {
+    static EXP: OnceLock<Experiment> = OnceLock::new();
+    EXP.get_or_init(Experiment::from_env)
+}
 
 #[derive(Debug, Clone, Copy)]
 enum PollCmd {
@@ -110,7 +167,7 @@ impl ApplicationHandler<UserEvent> for App {
             drain: MenuItem::new("Drain: —", false, None),
             remaining: MenuItem::new("Remaining: —", false, None),
             session: MenuItem::new("Session: —", false, None),
-            status: MenuItem::new("Status: looking for dongle…", false, None),
+            status: MenuItem::new(decorate("Status: looking for dongle…"), false, None),
             refresh: MenuItem::new("Refresh", true, None),
             startup: CheckMenuItem::new("Start with Windows", true, startup::is_enabled(), None),
             quit: MenuItem::new("Quit", true, None),
@@ -128,7 +185,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Cloud Flight — starting")
+            .with_tooltip(decorate("Cloud Flight — starting"))
             .with_icon(make_icon(IconKind::Disconnected))
             .build()
             .expect("tray icon");
@@ -159,7 +216,8 @@ impl ApplicationHandler<UserEvent> for App {
                     } else if event.id == items.refresh.id() {
                         let _ = self.cmd_tx.send(PollCmd::Refresh);
                     } else if event.id == items.startup.id() {
-                        let enabled = startup::set_enabled(!items.startup.is_checked());
+                        // muda already flipped the check before this event.
+                        let enabled = startup::set_enabled(items.startup.is_checked());
                         items.startup.set_checked(enabled);
                     }
                 }
@@ -204,9 +262,15 @@ impl App {
 
 fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
     thread::spawn(move || {
-        let mut api = HidApiOrNone::new();
+        let exp = *experiment();
+        hid::log_event("start", &exp.label());
+        let mut api = if exp.no_hid {
+            HidApiOrNone { inner: None }
+        } else {
+            HidApiOrNone::new()
+        };
         let mut drain = DrainTracker::load();
-        let mut last_percent: Option<f32> = None;
+        let mut last_percent = drain.last_percent();
         let mut last_raw: Option<u16> = None;
         let mut link = Connection::DongleMissing;
         let mut charging = false;
@@ -215,36 +279,58 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
         let mut next_battery = Instant::now();
         let mut last_status_query: Option<Instant> = None;
         let mut last_enum: Option<Instant> = None;
+        let mut closed_until: Option<Instant> = None;
 
         loop {
             let mut poll_battery = false;
             let mut user_refresh = false;
+            let mut force_query = false;
             match cmds.try_recv() {
                 Ok(PollCmd::Refresh) => user_refresh = true,
-                Ok(PollCmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Ok(PollCmd::Quit) => {
+                    hid::log_event("quit", "cmd");
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    hid::log_event("quit", "disconnect");
+                    break;
+                }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
 
+            if exp.close_when_charging {
+                if let Some(until) = closed_until {
+                    if Instant::now() < until {
+                        thread::sleep(LINK_WAIT);
+                        continue;
+                    }
+                    hid::log_event("recheck", "charging");
+                    closed_until = None;
+                    force_query = true;
+                }
+            }
+
             // Re-enumerating while both handles are open churns every HID device on the system.
-            if (power.is_none() || status_dev.is_none())
+            if !exp.no_hid
+                && (power.is_none() || status_dev.is_none())
                 && last_enum.is_none_or(|t| t.elapsed() >= ENUM_INTERVAL)
             {
                 api.refresh();
                 last_enum = Some(Instant::now());
             }
-            if power.is_none() {
+            if !exp.no_hid && !exp.no_power && power.is_none() {
                 if let Some(hidapi) = api.inner.as_ref() {
                     power = hid::open_power_device(hidapi);
                 }
             }
-            if status_dev.is_none() {
+            if !exp.no_hid && !exp.no_status && status_dev.is_none() {
                 if let Some(hidapi) = api.inner.as_ref() {
                     status_dev = hid::open_status_device(hidapi);
                 }
             }
             if power.is_none() && status_dev.is_none() && link != Connection::DongleMissing {
-                link = Connection::DongleMissing;
-                charging = false;
+                set_link(&mut link, Connection::DongleMissing);
+                set_charging(&mut charging, false);
                 publish(
                     &proxy,
                     &mut drain,
@@ -259,8 +345,8 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
             if let Some(device) = power.as_mut() {
                 match hid::read_power(device, LINK_WAIT.as_millis() as i32) {
                     Ok(Some(Connection::HeadsetOff)) => {
-                        link = Connection::HeadsetOff;
-                        charging = false;
+                        set_link(&mut link, Connection::HeadsetOff);
+                        set_charging(&mut charging, false);
                         saw_power_off = true;
                         publish(
                             &proxy,
@@ -279,10 +365,13 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                         if link != Connection::Connected {
                             poll_battery = true;
                         }
-                        link = Connection::Connected;
+                        set_link(&mut link, Connection::Connected);
                     }
                     Ok(_) => {}
-                    Err(_) => drop_power = true,
+                    Err(err) => {
+                        hid::log_event("drop", &format!("power read_err {err}"));
+                        drop_power = true;
+                    }
                 }
             } else {
                 thread::sleep(LINK_WAIT);
@@ -292,88 +381,141 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
             }
 
             // Off: never. While charging, only the slow interval (still needs Connected).
-            let auto_due = next_battery <= Instant::now()
-                && if charging {
-                    link == Connection::Connected
-                } else {
-                    may_auto_query(link, charging)
-                };
+            let auto_due = force_query
+                || (next_battery <= Instant::now()
+                    && if charging {
+                        link == Connection::Connected
+                    } else {
+                        may_auto_query(link, charging)
+                    });
             if user_refresh || poll_battery || auto_due {
-                if last_status_query.is_some_and(|started| started.elapsed() < MIN_STATUS_QUERY) {
+                let reason = if user_refresh {
+                    "user_refresh"
+                } else if force_query {
+                    "recheck"
+                } else if poll_battery {
+                    "connect"
+                } else {
+                    "auto_due"
+                };
+                if !should_write(&exp, user_refresh, poll_battery, auto_due) {
+                    hid::log_event("write", &format!("skip {reason}"));
+                    next_battery = Instant::now() + poll_interval(charging);
+                } else if last_status_query
+                    .is_some_and(|started| started.elapsed() < MIN_STATUS_QUERY)
+                {
                     if next_battery <= Instant::now() {
                         next_battery = Instant::now() + MIN_STATUS_QUERY;
                     }
                     continue;
-                }
-                last_status_query = Some(Instant::now());
-                let outcome = status_dev.as_mut().map(hid::query_battery);
-                match outcome {
-                    Some(QueryOutcome::Timeout) => {}
-                    Some(QueryOutcome::DeviceError) => {
-                        status_dev = None;
-                        if power.is_none() && !saw_power_off {
-                            link = Connection::DongleMissing;
-                            charging = false;
+                } else {
+                    last_status_query = Some(Instant::now());
+                    hid::log_event("write", reason);
+                    let outcome = status_dev.as_mut().map(hid::query_battery);
+                    match outcome {
+                        Some(QueryOutcome::Timeout) => {}
+                        Some(QueryOutcome::DeviceError) => {
+                            hid::log_event("drop", "status device_error");
+                            status_dev = None;
+                            if power.is_none() && !saw_power_off {
+                                set_link(&mut link, Connection::DongleMissing);
+                                set_charging(&mut charging, false);
+                                publish(
+                                    &proxy,
+                                    &mut drain,
+                                    RawStatus::disconnected(),
+                                    &mut last_percent,
+                                    &mut last_raw,
+                                );
+                            }
+                        }
+                        Some(QueryOutcome::Status(mut reading)) => {
+                            if reading.connection == Connection::DongleMissing {
+                                hid::log_event("drop", "status dongle_missing");
+                                status_dev = None;
+                                if power.is_none() {
+                                    set_link(&mut link, Connection::DongleMissing);
+                                }
+                            } else if saw_power_off || reading.connection == Connection::HeadsetOff
+                            {
+                                set_link(&mut link, Connection::HeadsetOff);
+                                reading.connection = Connection::HeadsetOff;
+                                reading.charging = Some(false);
+                            } else if reading.connection == Connection::Connected {
+                                set_link(&mut link, Connection::Connected);
+                            }
+                            set_charging(&mut charging, reading.charging == Some(true));
                             publish(
                                 &proxy,
                                 &mut drain,
-                                RawStatus::disconnected(),
+                                reading,
                                 &mut last_percent,
                                 &mut last_raw,
                             );
                         }
-                    }
-                    Some(QueryOutcome::Status(mut reading)) => {
-                        if reading.connection == Connection::DongleMissing {
-                            status_dev = None;
-                            if power.is_none() {
-                                link = Connection::DongleMissing;
+                        None => {
+                            let connection = connection_when_status_missing(
+                                power.is_some(),
+                                saw_power_off,
+                                link,
+                            );
+                            set_link(&mut link, connection);
+                            if connection != Connection::Connected {
+                                set_charging(&mut charging, false);
                             }
-                        } else if saw_power_off || reading.connection == Connection::HeadsetOff {
-                            link = Connection::HeadsetOff;
-                            reading.connection = Connection::HeadsetOff;
-                            reading.charging = Some(false);
-                        } else if reading.connection == Connection::Connected {
-                            link = Connection::Connected;
+                            let status = match connection {
+                                Connection::DongleMissing => RawStatus::disconnected(),
+                                Connection::HeadsetOff => RawStatus {
+                                    connection,
+                                    charging: Some(false),
+                                    percent: last_percent,
+                                    raw: last_raw,
+                                },
+                                Connection::Connected => RawStatus {
+                                    connection,
+                                    charging: None,
+                                    percent: last_percent,
+                                    raw: last_raw,
+                                },
+                            };
+                            publish(&proxy, &mut drain, status, &mut last_percent, &mut last_raw);
                         }
-                        charging = reading.charging == Some(true);
-                        publish(
-                            &proxy,
-                            &mut drain,
-                            reading,
-                            &mut last_percent,
-                            &mut last_raw,
-                        );
                     }
-                    None => {
-                        let connection =
-                            connection_when_status_missing(power.is_some(), saw_power_off, link);
-                        link = connection;
-                        if connection != Connection::Connected {
-                            charging = false;
-                        }
-                        let status = match connection {
-                            Connection::DongleMissing => RawStatus::disconnected(),
-                            Connection::HeadsetOff => RawStatus {
-                                connection,
-                                charging: Some(false),
-                                percent: last_percent,
-                                raw: last_raw,
-                            },
-                            Connection::Connected => RawStatus {
-                                connection,
-                                charging: None,
-                                percent: last_percent,
-                                raw: last_raw,
-                            },
-                        };
-                        publish(&proxy, &mut drain, status, &mut last_percent, &mut last_raw);
-                    }
+                    next_battery = Instant::now() + poll_interval(charging);
                 }
-                next_battery = Instant::now() + poll_interval(charging);
+            }
+            if exp.close_when_charging && charging && (power.is_some() || status_dev.is_some()) {
+                hid::log_event("drop", "both close_when_charging");
+                power = None;
+                status_dev = None;
+                closed_until = Some(Instant::now() + CLOSED_RECHECK);
             }
         }
     });
+}
+
+fn set_link(link: &mut Connection, next: Connection) {
+    if *link != next {
+        hid::log_event("link", &format!("{link:?}->{next:?}"));
+        *link = next;
+    }
+}
+
+fn set_charging(charging: &mut bool, next: bool) {
+    if *charging != next {
+        hid::log_event("charge", &format!("{charging}->{next}"));
+        *charging = next;
+    }
+}
+
+fn should_write(exp: &Experiment, user: bool, on_connect: bool, auto: bool) -> bool {
+    if exp.no_hid || exp.no_query || exp.no_status {
+        return false;
+    }
+    if exp.no_connect_query && on_connect && !user && !auto {
+        return false;
+    }
+    user || on_connect || auto
 }
 
 fn publish(
@@ -426,6 +568,7 @@ impl HidApiOrNone {
     }
 
     fn refresh(&mut self) {
+        hid::log_event("enum", "refresh");
         if let Some(api) = &mut self.inner {
             let _ = api.refresh_devices();
         } else {
@@ -475,10 +618,10 @@ fn tooltip_text(update: &HeadsetUpdate) -> String {
                 .map(format_duration)
                 .map(|s| format!("~{s} left"))
                 .unwrap_or_else(|| "ETA —".into());
-            return format!("Cloud Flight  {level}  |  {drain}  |  {eta}");
+            return decorate(format!("Cloud Flight  {level}  |  {drain}  |  {eta}"));
         }
     };
-    format!("Cloud Flight  {state}")
+    decorate(format!("Cloud Flight  {state}"))
 }
 
 fn charging_level_text(percent: Option<f32>, raw: Option<u16>) -> String {
@@ -535,8 +678,18 @@ fn session_line(drain: &DrainStats) -> String {
     }
 }
 
+fn decorate(line: impl Into<String>) -> String {
+    let line = line.into();
+    let label = experiment().label();
+    if label.is_empty() {
+        line
+    } else {
+        format!("{line} [{label}]")
+    }
+}
+
 fn status_line(update: &HeadsetUpdate) -> String {
-    match update.connection {
+    let line = match update.connection {
         Connection::DongleMissing => "Headset: Dongle disconnected".into(),
         Connection::HeadsetOff => "Headset: Turned off".into(),
         Connection::Connected if update.charging == Some(true) => {
@@ -546,7 +699,8 @@ fn status_line(update: &HeadsetUpdate) -> String {
             )
         }
         Connection::Connected => "Headset: Connected".into(),
-    }
+    };
+    decorate(line)
 }
 
 fn connection_when_status_missing(
@@ -643,6 +797,27 @@ mod tests {
             ..update
         };
         assert!(tooltip_text(&full).contains("fully charged"));
+    }
+
+    #[test]
+    fn switches_gate_the_status_write() {
+        let mut exp = Experiment {
+            no_query: false,
+            no_status: false,
+            no_power: false,
+            no_hid: false,
+            no_connect_query: false,
+            close_when_charging: false,
+        };
+        assert!(should_write(&exp, false, true, false));
+        exp.no_connect_query = true;
+        assert!(!should_write(&exp, false, true, false));
+        assert!(should_write(&exp, true, true, false));
+        exp.no_query = true;
+        assert!(!should_write(&exp, true, false, true));
+        exp.no_query = false;
+        exp.no_hid = true;
+        assert!(!should_write(&exp, true, true, true));
     }
 
     #[test]

@@ -128,8 +128,12 @@ impl DrainTracker {
 
     pub fn latest_stats(&self) -> DrainStats {
         let now = now_secs();
-        let current = self.samples.last().map(|s| s.p);
-        self.stats(current, now)
+        self.stats(self.last_percent(), now)
+    }
+
+    /// Last discharge reading. Charging reports do not carry a percent.
+    pub fn last_percent(&self) -> Option<f32> {
+        self.samples.last().map(|s| s.p)
     }
 
     fn prune(&mut self, now: i64) {
@@ -455,9 +459,19 @@ mod tests {
             std::process::id(),
             now_secs()
         ));
+        let now = now_secs();
         let mut tracker = DrainTracker {
-            samples: vec![Sample { t: 0, p: 80.0 }, Sample { t: 600, p: 78.0 }],
-            session_start: Some(Sample { t: 0, p: 80.0 }),
+            samples: vec![
+                Sample {
+                    t: now - 600,
+                    p: 80.0,
+                },
+                Sample { t: now - 60, p: 78.0 },
+            ],
+            session_start: Some(Sample {
+                t: now - 600,
+                p: 80.0,
+            }),
             learned_nominal_rate: Some(4.0),
             was_charging: false,
             was_disconnected: false,
@@ -467,6 +481,7 @@ mod tests {
         };
         let learned_before = tracker.learned_nominal_rate;
         tracker.record(78.0, true, true);
+        assert_eq!(tracker.last_percent(), Some(78.0));
         assert!(tracker.was_charging);
         assert!(tracker.session_start.is_none());
         assert_eq!(tracker.learned_nominal_rate, learned_before);

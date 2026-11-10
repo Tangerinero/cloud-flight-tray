@@ -61,11 +61,13 @@ pub fn is_supported(vid: u16, pid: u16) -> bool {
 }
 
 pub fn open_status_device(api: &HidApi) -> Option<HidDevice> {
-    open_matching(api, |info| info.usage() == STATUS_USAGE)
+    open_logged("open_status", api, |info| info.usage() == STATUS_USAGE)
 }
 
 pub fn open_power_device(api: &HidApi) -> Option<HidDevice> {
-    open_matching(api, |info| info.usage_page() == POWER_USAGE_PAGE)
+    open_logged("open_power", api, |info| {
+        info.usage_page() == POWER_USAGE_PAGE
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,12 +98,10 @@ pub fn query_battery(device: &mut HidDevice) -> QueryOutcome {
             Ok(0) => break,
             Ok(n) => {
                 let status = parse_report(&buf[..n]);
-                log_line(&format!(
-                    "{} bytes={:02x?} parsed={:?}",
-                    unix_secs(),
-                    &buf[..n],
-                    status
-                ));
+                log_event(
+                    "status",
+                    &format!("bytes={:02x?} parsed={status:?}", &buf[..n]),
+                );
                 if let Some(status) = status {
                     return QueryOutcome::Status(status);
                 }
@@ -120,6 +120,11 @@ pub fn read_power(
 ) -> hidapi::HidResult<Option<Connection>> {
     let mut buf = [0u8; 64];
     let n = device.read_timeout(&mut buf, timeout_ms)?;
+    if n >= 1 && buf[0] == 0x64 {
+        let event = power_event(&buf[..n]);
+        log_event("power", &format!("{:02x?} {event:?}", &buf[..n.min(8)]));
+        return Ok(event);
+    }
     Ok(power_event(&buf[..n]))
 }
 
@@ -130,27 +135,37 @@ fn power_event(buf: &[u8]) -> Option<Connection> {
     parse_report(buf).map(|status| status.connection)
 }
 
-fn open_matching(api: &HidApi, pred: impl Fn(&hidapi::DeviceInfo) -> bool) -> Option<HidDevice> {
+fn open_logged(
+    tag: &str,
+    api: &HidApi,
+    pred: impl Fn(&hidapi::DeviceInfo) -> bool,
+) -> Option<HidDevice> {
     for info in api.device_list() {
         if !is_supported(info.vendor_id(), info.product_id()) || !pred(info) {
             continue;
         }
-        if let Ok(dev) = api.open_path(info.path()) {
-            log_line(&format!(
-                "{} open vid={:04x} pid={:04x} usage_page={:#06x} usage={:#06x}",
-                unix_secs(),
-                info.vendor_id(),
-                info.product_id(),
-                info.usage_page(),
-                info.usage()
-            ));
-            return Some(dev);
+        match api.open_path(info.path()) {
+            Ok(dev) => {
+                log_event(
+                    tag,
+                    &format!(
+                        "ok vid={:04x} pid={:04x} usage_page={:#06x} usage={:#06x}",
+                        info.vendor_id(),
+                        info.product_id(),
+                        info.usage_page(),
+                        info.usage()
+                    ),
+                );
+                return Some(dev);
+            }
+            Err(err) => log_event(tag, &format!("open_path {err}")),
         }
     }
+    log_event(tag, "fail");
     None
 }
 
-fn log_line(line: &str) {
+pub fn log_event(tag: &str, detail: &str) {
     use std::io::Write;
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -162,20 +177,17 @@ fn log_line(line: &str) {
     {
         let _ = std::fs::remove_file(&path);
     }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{line}");
+        let _ = writeln!(f, "{ms} {tag} {detail}");
     }
-}
-
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn send_status_request(device: &mut HidDevice) -> hidapi::HidResult<()> {
