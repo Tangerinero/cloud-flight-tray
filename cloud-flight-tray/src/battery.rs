@@ -2,7 +2,7 @@
 
 const THRESHOLDS: [u16; 20] = [
     3328, 3584, 3674, 3704, 3732, 3744, 3754, 3764, 3774, 3784, 3794, 3804, 3824, 3840, 3860, 3890,
-    3910, 3940, 3960, 3970,
+    3910, 3940, 3960, 4096,
 ];
 
 /// Headset hardware cuts off near 3.20 V, not at a raw value of 0.
@@ -25,7 +25,7 @@ pub enum BatteryReading {
 }
 
 pub fn is_charging(upper: u8, _lower: u8) -> bool {
-    // Discharge samples top out at raw 3970 (upper byte 0x0F). 0x10 and above is the charge range.
+    // Discharge reports stay in upper byte 0x0F (seen up to raw 4093). 0x10 and above is charging.
     upper >= CHARGING_UPPER_MIN
 }
 
@@ -48,7 +48,7 @@ pub fn parse_battery_bytes(upper: u8, lower: u8) -> BatteryReading {
 }
 
 pub fn interpolate_percent(raw: u16) -> f32 {
-    // Only path to 100%. Unverified; log raw bytes before changing THRESHOLDS.
+    // 100% is raw 4096. Clamping at 3970 held a 10h discharge (4093 down to 3974) at 100%.
     if raw >= *THRESHOLDS.last().unwrap() {
         return 100.0;
     }
@@ -90,7 +90,12 @@ mod tests {
     #[test]
     fn exact_thresholds() {
         assert_eq!(interpolate_percent(3328), 5.0);
-        assert_eq!(interpolate_percent(3970), 100.0);
+        assert_eq!(interpolate_percent(4096), 100.0);
+        let near_old_ceiling = interpolate_percent(3974);
+        assert!(
+            (95.0..100.0).contains(&near_old_ceiling),
+            "raw 3974 must not stay pinned at 100, got {near_old_ceiling}"
+        );
         assert_eq!(interpolate_percent(3784), 50.0);
     }
 

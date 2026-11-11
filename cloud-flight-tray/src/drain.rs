@@ -246,7 +246,7 @@ fn discharge_segment(samples: &[Sample], origin: Option<i64>) -> &[Sample] {
         None => 0,
     };
     for i in (start + 1)..samples.len() {
-        let jumped = samples[i].p - samples[i - 1].p > RECHARGE_JUMP;
+        let jumped = (samples[i].p - samples[i - 1].p).abs() > RECHARGE_JUMP;
         let idle = samples[i].t - samples[i - 1].t > MAX_IDLE_GAP_SECS;
         if jumped || idle {
             start = i;
@@ -466,7 +466,10 @@ mod tests {
                     t: now - 600,
                     p: 80.0,
                 },
-                Sample { t: now - 60, p: 78.0 },
+                Sample {
+                    t: now - 60,
+                    p: 78.0,
+                },
             ],
             session_start: Some(Sample {
                 t: now - 600,
@@ -557,6 +560,15 @@ mod tests {
             },
         ];
         assert_eq!(discharge_segment(&continuous, None).len(), 2);
+
+        let cliff = vec![
+            Sample { t: 0, p: 100.0 },
+            Sample { t: 60, p: 95.0 },
+            Sample { t: 120, p: 94.0 },
+        ];
+        let fresh = discharge_segment(&cliff, None);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh[0].p, 95.0);
     }
 
     #[test]

@@ -220,9 +220,13 @@ pub fn parse_report(data: &[u8]) -> Option<RawStatus> {
     }
 
     let (upper, lower) = (data[3], data[4]);
-    // Same bytes as the status request. An echo is not a power-off or a battery level.
     if upper == 0 && lower == 0 {
-        return None;
+        return Some(RawStatus {
+            connection: Connection::HeadsetOff,
+            charging: Some(false),
+            percent: None,
+            raw: None,
+        });
     }
 
     match parse_battery_bytes(upper, lower) {
@@ -260,10 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_status_is_not_a_battery_level() {
-        assert!(parse_report(&[0x21, 0xFF, 0x05, 0x00, 0x00]).is_none());
-        let kept = keep_measured_percent(Some(65.0), None);
-        assert_eq!(kept, Some(65.0));
+    fn zero_status_is_headset_off() {
+        let s = parse_report(&[0x21, 0xFF, 0x05, 0x00, 0x00]).unwrap();
+        assert_eq!(s.connection, Connection::HeadsetOff);
+        assert_eq!(s.charging, Some(false));
+        assert!(s.percent.is_none());
+        assert!(s.raw.is_none());
+        assert_eq!(keep_measured_percent(Some(65.0), s.percent), Some(65.0));
     }
 
     #[test]

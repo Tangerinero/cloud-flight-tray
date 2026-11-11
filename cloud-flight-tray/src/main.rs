@@ -280,13 +280,13 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
         let mut last_status_query: Option<Instant> = None;
         let mut last_enum: Option<Instant> = None;
         let mut closed_until: Option<Instant> = None;
+        let mut pending_user_refresh = false;
+        let mut pending_connect_poll = false;
 
         loop {
-            let mut poll_battery = false;
-            let mut user_refresh = false;
             let mut force_query = false;
             match cmds.try_recv() {
-                Ok(PollCmd::Refresh) => user_refresh = true,
+                Ok(PollCmd::Refresh) => pending_user_refresh = true,
                 Ok(PollCmd::Quit) => {
                     hid::log_event("quit", "cmd");
                     break;
@@ -342,8 +342,16 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
 
             let mut drop_power = false;
             let mut saw_power_off = false;
+            let command_pending = pending_user_refresh || pending_connect_poll;
+            let throttled =
+                last_status_query.is_some_and(|started| started.elapsed() < MIN_STATUS_QUERY);
+            let link_wait_ms = if command_pending && !throttled {
+                0
+            } else {
+                LINK_WAIT.as_millis() as i32
+            };
             if let Some(device) = power.as_mut() {
-                match hid::read_power(device, LINK_WAIT.as_millis() as i32) {
+                match hid::read_power(device, link_wait_ms) {
                     Ok(Some(Connection::HeadsetOff)) => {
                         set_link(&mut link, Connection::HeadsetOff);
                         set_charging(&mut charging, false);
@@ -363,7 +371,7 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                     }
                     Ok(Some(Connection::Connected)) => {
                         if link != Connection::Connected {
-                            poll_battery = true;
+                            pending_connect_poll = true;
                         }
                         set_link(&mut link, Connection::Connected);
                     }
@@ -373,7 +381,7 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                         drop_power = true;
                     }
                 }
-            } else {
+            } else if link_wait_ms > 0 {
                 thread::sleep(LINK_WAIT);
             }
             if drop_power {
@@ -388,18 +396,20 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                     } else {
                         may_auto_query(link, charging)
                     });
-            if user_refresh || poll_battery || auto_due {
-                let reason = if user_refresh {
+            if pending_user_refresh || pending_connect_poll || auto_due {
+                let reason = if pending_user_refresh {
                     "user_refresh"
                 } else if force_query {
                     "recheck"
-                } else if poll_battery {
+                } else if pending_connect_poll {
                     "connect"
                 } else {
                     "auto_due"
                 };
-                if !should_write(&exp, user_refresh, poll_battery, auto_due) {
+                if !should_write(&exp, pending_user_refresh, pending_connect_poll, auto_due) {
                     hid::log_event("write", &format!("skip {reason}"));
+                    pending_user_refresh = false;
+                    pending_connect_poll = false;
                     next_battery = Instant::now() + poll_interval(charging);
                 } else if last_status_query
                     .is_some_and(|started| started.elapsed() < MIN_STATUS_QUERY)
@@ -409,6 +419,8 @@ fn spawn_hid_thread(proxy: EventLoopProxy<UserEvent>, cmds: Receiver<PollCmd>) {
                     }
                     continue;
                 } else {
+                    pending_user_refresh = false;
+                    pending_connect_poll = false;
                     last_status_query = Some(Instant::now());
                     hid::log_event("write", reason);
                     let outcome = status_dev.as_mut().map(hid::query_battery);
